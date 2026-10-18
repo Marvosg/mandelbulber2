@@ -1,10 +1,10 @@
 # Mandelbulber2 MCP
 
-Phase 2 of this note is in the tree. The app listens on a local socket (`src/mcp_server.cpp`, `src/mcp_catalog.cpp`, `mandelbulber2 --mcp`). The official Python MCP SDK adapter is `mcp/` and speaks stdio. Install and client config are in `mcp/README.md`.
+The app listens on a local socket (`src/mcp_server.cpp`, `src/mcp_catalog.cpp`, `src/mcp_scene.cpp`, `mandelbulber2 --mcp`). The official Python MCP SDK adapter is `mcp/` and speaks stdio. Install and client config are in `mcp/README.md`.
 
-The eight decisions in the last section are accepted as written: Python bridge, official MCP SDK, stdio plus `QLocalServer`, Cursor and Claude Desktop on the same machine, attach or launch `--mcp`, live-session edits with one undo step and widget sync, the dmg contains only the app, and this change is the core slice only.
+The eight decisions in the last section are accepted as written: Python bridge, official MCP SDK, stdio plus `QLocalServer`, Cursor and Claude Desktop on the same machine, attach or launch `--mcp`, live-session edits with one undo step and widget sync, the dmg contains only the app, and the first coding change was the core slice. The scene slice is now in the same tree: objects, materials and lights, keyframes and flight, and render jobs.
 
-The goal is the same shape as Blender MCP: an agent connected to the Mandelbulber the user already has open, able to set up formulas, camera, lighting, materials, effects, animation, and renders, and able to look at a cheap preview before committing to a long render. The user will not know parameter names, so the tools have to teach the agent. Materials, the objects tree, keyframes, flight, and full render jobs are still the next slice.
+The goal is the same shape as Blender MCP: an agent connected to the Mandelbulber the user already has open, able to set up formulas, camera, lighting, materials, effects, animation, and renders, and able to look at a cheap preview before committing to a long render. The user will not know parameter names, so the tools have to teach the agent.
 
 ## How the program is put together
 
@@ -201,7 +201,19 @@ The stored default `mandelbox_scale` is 2. From the default camera that value dr
 
 Numbers from the socket are parsed in the C locale. A string with one decimal comma and no dot is accepted. A token that contains both separators is rejected. `cMultiVal::Store(QString)` still uses the system locale; the MCP path does not call it.
 
-Objects-tree helpers, materials, keyframes, and flight use the same socket and are the next slice.
+### Scene slice
+
+Implemented in `src/mcp_scene.cpp` and the matching Python tools.
+
+- Objects tree: `get_objects_tree`, `add_object`, `update_object`, `delete_object`. Types are fractal, hybrid, boolean_add, boolean_mul, boolean_sub, and primitive. A hybrid's fractal children are one stack; `formula_iterations` is the repeat count. Booleans are real renderer nodes. A primitive cannot be a child of a hybrid. Fractal nodes use the nine existing slots.
+- Looks: `set_material`, `set_light`, and the existing effects parameters (`iteration_fog_*`, `glow_*`, brightness). `get_guidance` has recipes for a clay-and-fog look as well as the shapes.
+- Animation: `get_animation`, `add_keyframe`, `update_keyframe`, `delete_keyframe`, `set_flight_path` (orbit, fly-through, or an explicit frame list). Keyframe tools default `frames_per_keyframe` to 4. The application's own default of 100 is left alone. Interpolation is the parameter morph (Akima for the camera). The last key contributes one frame.
+- Jobs: `render_still` and `render_animation` return a job id. `render_status`, `stop_render`, and `get_image` (optional `max_edge`) follow them. Animation ranges default to a cap of 24 frames and refuse anything over `max_frames` (hard maximum 500). Output is `frame_NNNN.png`.
+- `render_preview` still returns a PNG to the client. The render runs on a worker thread. The socket waits in a `QEventLoop`, so the window keeps handling events, including `stop_render` and `render_status`. Mutations are refused while a job is running. Stop sets the job's flag. It does not call `cInterface::StopRender` (that raises a dialog). A window render is stopped with `stopRequest` only when that window is actually rendering.
+- The socket is created before the autosave-recovery dialog. The undo baseline is stored after the dialog, so the first undo is the scene the user kept.
+- Keyframe and flight rendering does not call the GUI's render slots. Those pop confirmation dialogs and are null in `--mcp`. Each frame is a still of a copy.
+
+The Windows named-pipe client in the Python adapter is still not implemented. The app listens on Windows; the adapter cannot connect yet.
 
 ## macOS build plan
 
@@ -216,7 +228,7 @@ From `.circleci/config.yml` (macOS, Xcode 27):
 5. Intel: `qmake mandelbulber-opencl-mac.pro` with clang from `/usr/local/opt/llvm` (CircleCI symlinks Homebrew LLVM there). C++14.
 6. `make`, then `macdeployqt mandelbulber2.app -dmg`.
 
-`qmake/macos.pri` copies formula, examples, materials, icons, sounds, textures, toolbar, data, docs, and language into `Contents/Resources`. `SHARED_DIR_IS_APP_DIR` makes the app load them from the bundle. A socket server compiled into the binary needs no extra bundle entries.
+`qmake/macos.pri` copies formula, examples, materials, icons, sounds, textures, toolbar, data, docs, and language into `Contents/Resources`. `SHARED_DIR_IS_APP_DIR` makes the app load them from the bundle. A socket server compiled into the binary needs no extra bundle entries. Dock-widget tooltips for an installed app live in `deploy/share/mandelbulber2/data/mcp-dock-tooltips.json`, which is copied because `data/` is already in that list. Formula `.ui` files are already in the bundle. A developer tree that still has `qt/` next to `formula/` prefers those live `.ui` tooltips; the JSON fills whatever is missing, including a macOS app that does not ship `qt/*.ui`. Run qmake again after adding `src/*.cpp` files. The Python adapter stays out of the dmg.
 
 The Python MCP server stays **outside** the `.app`. `macdeployqt` will not produce a working embedded Python, and a relocatable interpreter is a separate packaging project. Document, for both Mac and Linux:
 

@@ -97,10 +97,12 @@ From `mandelbulber2/qmake`:
 
 Then `make` and `macdeployqt mandelbulber2.app -dmg`.
 
-`macos.pri` copies formulas, examples, materials, and the other share files into `Contents/Resources`. The socket is already in the binary. Do not bundle this Python package into the dmg. `macdeployqt` will not produce a working embedded interpreter.
+`macos.pri` copies formulas, examples, materials, and the other share files into `Contents/Resources`, including `data/mcp-dock-tooltips.json`. That file is the dock-tooltip text for an installed app. A developer tree with `qt/` next to the formulas still prefers the live `.ui` files. The socket is already in the binary. Do not bundle this Python package into the dmg. `macdeployqt` will not produce a working embedded interpreter.
 
 New `mandelbulber2/src/*.cpp` files are picked up by `SOURCES += $$ROOT/src/*.cpp` only when qmake is run again.
 
 ## What the tools cover
 
-Formulas and their parameters, camera, lights, quality, a draft PNG preview, load, save, undo. The objects tree, material editor, keyframes, flight, and full-resolution render jobs are the next slice. See `docs/mcp-design.md`.
+Formulas and their parameters, the objects tree (hybrids, booleans, primitives), materials, lights, camera, keyframes, orbit and fly-through paths, a draft PNG preview, still and animation jobs with status, stop, and a downscaled image, plus load, save, and undo. `get_guidance` has the starter recipes. See `docs/mcp-design.md`.
+
+On Windows the application listens on a named pipe. This adapter's pipe client is not written yet, so Windows still needs that piece before the tools can connect.

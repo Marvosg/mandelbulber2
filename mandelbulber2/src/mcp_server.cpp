@@ -6,6 +6,8 @@
 
 #include "mcp_server.h"
 
+#include "mcp_scene.h"
+
 #include "mcp_catalog.h"
 
 #include <QCoreApplication>
@@ -521,18 +523,19 @@ bool cMcpServer::Start()
 	owningSession = true;
 	WriteSessionFile();
 
-	if (gUndo)
-	{
-		gUndo->Store(gPar, gParFractal, gAnimFrames, gKeyframes);
-		gUndo->CommitNow();
-	}
-
 	QTextStream out(stdout);
 	out << "MCP session file: " << sessionPath << "\n";
 	out << "MCP socket: " << socketPath << "\n";
 	out.flush();
 	WriteLog(QString("MCP server listening on %1").arg(socketPath), 1);
 	return true;
+}
+
+void cMcpServer::NoteBaseline()
+{
+	if (!gUndo || !gPar || !gParFractal || !gAnimFrames || !gKeyframes) return;
+	gUndo->Store(gPar, gParFractal, gAnimFrames, gKeyframes);
+	gUndo->CommitNow();
 }
 
 void cMcpServer::WriteSessionFile()
@@ -638,6 +641,21 @@ QByteArray cMcpServer::HandleLine(const QByteArray &line)
 
 QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &params)
 {
+	if (mcpScene::JobActive())
+	{
+		const QStringList allowed = {"get_session", "get_state", "list_formulas", "describe_formula",
+			"list_parameters", "describe_parameter", "list_examples", "get_objects_tree", "get_animation",
+			"get_image", "render_status", "stop_render"};
+		if (!allowed.contains(method))
+		{
+			return Fail("A render is already running. Poll render_status or get_image, or call "
+									"stop_render before changing the session.");
+		}
+	}
+
+	QJsonObject sceneResult;
+	if (mcpScene::Dispatch(method, params, &sceneResult)) return sceneResult;
+
 	if (method == "get_session")
 	{
 		QJsonObject result;
@@ -647,7 +665,8 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		result["socket"] = socketPath;
 		result["loaded_file"] = systemData.lastSettingsFile;
 		const bool rendering =
-			gMainInterface && gMainInterface->mainImage && gMainInterface->mainImage->IsUsed();
+			(gMainInterface && gMainInterface->mainImage && gMainInterface->mainImage->IsUsed())
+			|| mcpScene::JobActive();
 		result["render_running"] = rendering;
 		result["headless_command"] = "mandelbulber2 --mcp";
 		return result;
@@ -805,101 +824,6 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		result["display_name"] = QString::fromStdString(match->getNameInComboBox());
 		result["id"] = int(match->getInternalId());
 		return result;
-	}
-
-	if (method == "render_preview")
-	{
-		if (gMainInterface && gMainInterface->mainImage && gMainInterface->mainImage->IsUsed())
-		{
-			return Fail("A render is already running in the open Mandelbulber window. Wait until it "
-									"finishes, or stop it there, before asking for a preview.");
-		}
-		QString quality = params.value("quality").toString("draft");
-		if (quality != "draft" && quality != "better")
-			return Fail("quality must be \"draft\" or \"better\".");
-		int longSide = params.value("long_side").toInt(quality == "better" ? 480 : 320);
-		longSide = qBound(32, longSide, 640);
-		const double detailCap = quality == "better" ? 1.0 : 0.6;
-
-		auto previewPar = std::make_shared<cParameterContainer>(*gPar);
-		auto previewFractal = std::make_shared<cFractalContainer>(*gParFractal);
-		int width = previewPar->Get<int>("image_width");
-		int height = previewPar->Get<int>("image_height");
-		if (width < 1) width = 800;
-		if (height < 1) height = 450;
-		const double aspect = double(width) / double(height);
-		int previewWidth = longSide;
-		int previewHeight = qMax(16, int(qRound(longSide / aspect)));
-		if (height > width)
-		{
-			previewHeight = longSide;
-			previewWidth = qMax(16, int(qRound(longSide * aspect)));
-		}
-		previewPar->Set("image_width", previewWidth);
-		previewPar->Set("image_height", previewHeight);
-		if (previewPar->Get<double>("detail_level") > detailCap)
-			previewPar->Set("detail_level", detailCap);
-		const QStringList disable = {"ambient_occlusion_enabled", "DOF_enabled", "volumetric_fog_enabled",
-			"raytraced_reflections", "DOF_MC_global_illumination"};
-		for (const QString &name : disable)
-		{
-			if (previewPar->IfExists(name)) previewPar->Set(name, false);
-		}
-		// A fresh session has no mat1. The ray marcher then substitutes a missing
-		// material and the PNG is black. Define the default material on the copy only.
-		if (!previewPar->IfExists("mat1_is_defined") || !previewPar->Get<bool>("mat1_is_defined"))
-		{
-			InitMaterialParams(1, previewPar);
-			previewPar->Set("mat1_is_defined", true);
-		}
-
-		auto image = std::make_shared<cImage>(previewWidth, previewHeight);
-		bool stop = false;
-		cRenderJob job(previewPar, previewFractal, image, 1, &stop);
-		cRenderingConfiguration config;
-		config.DisableRefresh();
-		config.DisableProgressiveRender();
-		QElapsedTimer timer;
-		timer.start();
-		if (!job.Init(cRenderJob::still, config) || !job.Execute())
-			return Fail("The preview render did not finish.");
-
-		previewSerial++;
-		const QString base = QDir(QDir::tempPath())
-														 .filePath(QString("mandelbulber-preview-%1-%2")
-																					 .arg(QCoreApplication::applicationPid())
-																					 .arg(previewSerial));
-		ImageFileSave::structSaveImageChannel channel(
-			ImageFileSave::IMAGE_CONTENT_COLOR, ImageFileSave::IMAGE_CHANNEL_QUALITY_8, QString());
-		ImageFileSave::ImageConfig imageConfig;
-		imageConfig.insert(ImageFileSave::IMAGE_CONTENT_COLOR, channel);
-		ImageFileSavePNG saver(base, image, imageConfig);
-		const QStringList saved = saver.SaveImage();
-		if (saved.isEmpty()) return Fail("The preview rendered but the PNG could not be written.");
-		lastPreviewPath = saved.first();
-		QJsonObject result;
-		result["path"] = lastPreviewPath;
-		result["width"] = previewWidth;
-		result["height"] = previewHeight;
-		result["quality"] = quality;
-		result["detail_level"] = previewPar->Get<double>("detail_level");
-		result["milliseconds"] = double(timer.elapsed());
-		result["note"] =
-			"This PNG is a throwaway low-quality copy. The session's resolution, detail level, and "
-			"expensive effects were not changed.";
-		return result;
-	}
-
-	if (method == "get_image")
-	{
-		if (!lastPreviewPath.isEmpty() && QFile::exists(lastPreviewPath))
-		{
-			QJsonObject result;
-			result["path"] = lastPreviewPath;
-			result["source"] = "last_preview";
-			return result;
-		}
-		return Fail("No preview has been rendered in this session yet. Call render_preview.");
 	}
 
 	if (method == "load_settings" || method == "load_example")

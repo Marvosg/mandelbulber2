@@ -25,9 +25,13 @@ Then make, then:
 
 macos.pri copies formula, examples, materials, icons, sounds, textures,
 toolbar, data, language, opencl, and doc into Contents/Resources. The MCP
-socket is compiled into the binary. The Python adapter in mcp/ is installed
+socket is compiled into the binary. data/mcp-dock-tooltips.json rides along
+in that data directory, so an installed app has the dock-widget descriptions
+without shipping qt/*.ui. The Python adapter in mcp/ is installed
 separately with uv or pip and is not part of the dmg. See mcp/README.md
-for Cursor and Claude Desktop config.
+for Cursor and Claude Desktop config. The adapter can drive the objects
+tree, materials, lights, keyframes, flight paths, and still or animation
+renders. Point MANDELBULBER_BIN at Contents/MacOS/mandelbulber2.
 
 New source files under src/ are picked up by qmake's src/*.cpp wildcard only
 after you run qmake again.

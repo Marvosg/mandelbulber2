@@ -10,6 +10,8 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QRegularExpression>
 #include <QSet>
 #include <QXmlStreamReader>
@@ -430,7 +432,8 @@ QString AreaOf(const QString &name)
 	if (name == "fov" || name == "target" || name.startsWith("camera") || name.startsWith("perspective")
 		|| name.startsWith("stereo"))
 		return "camera";
-	if (name.startsWith("main_light") || name.startsWith("aux_light")) return "lights";
+	if (name.startsWith("main_light") || name.startsWith("aux_light") || name.startsWith("light"))
+		return "lights";
 	if (name.startsWith("mat")) return "materials";
 	if (name.startsWith("anim_") || name.startsWith("flight_") || name.startsWith("keyframe_"))
 		return "animation";
@@ -446,8 +449,25 @@ QString AreaOf(const QString &name)
 	return "other";
 }
 
+void RememberTooltip(const QString &key, const QString &text)
+{
+	if (key.isEmpty() || text.isEmpty() || gTooltips.contains(key)) return;
+	gTooltips.insert(key, text);
+	const QStringList suffixes = {"_x", "_y", "_z", "_w", "_R", "_G", "_B"};
+	for (const QString &suffix : suffixes)
+	{
+		if (!key.endsWith(suffix) || key.size() <= suffix.size()) continue;
+		const QString base = key.left(key.size() - suffix.size());
+		if (!gTooltips.contains(base)) gTooltips.insert(base, text);
+		break;
+	}
+}
+
 void LoadDockTooltips()
 {
+	// Live .ui files win when a developer tree still has qt/ next to formula/.
+	// An installed app, including the macOS bundle, does not ship those .ui
+	// files. data/mcp-dock-tooltips.json is copied with the rest of data/.
 	QStringList dirs;
 	const QString formulaDir =
 		QFileInfo(systemDirectories.sharedDir + "formula").canonicalFilePath();
@@ -463,12 +483,16 @@ void LoadDockTooltips()
 		{
 			const sParsedUi parsed = ParseUiFile(files.next());
 			for (auto it = parsed.tooltips.constBegin(); it != parsed.tooltips.constEnd(); ++it)
-			{
-				if (!gTooltips.contains(it.key())) gTooltips.insert(it.key(), it.value());
-			}
+				RememberTooltip(it.key(), it.value());
 		}
 		break;
 	}
+
+	QFile jsonFile(systemDirectories.sharedDir + "data/mcp-dock-tooltips.json");
+	if (!jsonFile.open(QIODevice::ReadOnly)) return;
+	const QJsonObject object = QJsonDocument::fromJson(jsonFile.readAll()).object();
+	for (auto it = object.constBegin(); it != object.constEnd(); ++it)
+		RememberTooltip(it.key(), it.value().toString());
 }
 
 void BuildIndex()

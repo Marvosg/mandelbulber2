@@ -11,10 +11,10 @@ real change, describe what they should see, and only then offer the next knob.
 
 A Mandelbulber picture is a camera looking at a 3D fractal. The fractal is a
 formula (Mandelbulb, Mandelbox, and hundreds of others) repeated until it either
-escapes or hits the iteration limit. Slots 1 to 9 each hold one formula. Slot 1
-is the shape you get in a fresh session. The other slots stay idle until a hybrid
-or a boolean in the objects tree uses them. Building that tree is not in this
-slice; you can still put a formula in a slot so it is ready.
+escapes or hits the iteration limit. Slots 1 to 9 each hold one formula. The
+picture is the objects tree, not the slots by themselves. Slot 1 is the shape
+you get in a fresh session because the default tree has one fractal node that
+points at slot 1. Other slots stay idle until a tree node uses them.
 
 The number people mean by "the power" is the parameter power on that slot.
 It is not N. N is the maximum number of iterations for a ray. Cutting N to go
@@ -25,7 +25,7 @@ detail_level is sharpness. 1.0 keeps features about 2 pixels across. 0.3 is a
 sketch. 2 and above is a slow final. DE_factor is the step size: 1 is normal,
 lower is more careful and slower.
 
-## Three recipes that always work
+## Recipes that always work
 
 1. Classic Mandelbulb. set_formula slot 1 to mandelbulb. set_parameters power to 8
    on fractal_slot 1. Leave the camera (it already looks at the origin from a
@@ -42,17 +42,21 @@ lower is more careful and slower.
    You should see a city of boxes. Near -2 the boxes get tighter. Near 0 the
    shape collapses. Call describe_formula before you touch folding radii.
 
-3. A two-formula hybrid, described but not fully built. Put mandelbulb in slot 1
-   and mandelbox in slot 2 with set_formula. Tell the user the objects tree (the
-   next slice of this bridge) is what actually nests them: a hybrid node runs
-   the formulas in order, and formula_iterations is how many times that slot's
-   formula repeats inside one step. formula_iterations 1 means once. 8 makes
-   that formula dominate. Do not pretend the second slot is already in the
-   picture if the objects tree still has a single fractal node.
+3. Two-formula hybrid. get_objects_tree, then add_object type hybrid (parent_id
+   0). add_object type fractal, formula mandelbulb, parent_id of that hybrid,
+   formula_iterations 1. add_object type fractal, formula mandelbox, same
+   parent_id, formula_iterations 1. set_parameters mandelbox_scale -1.5 on the
+   slot that the second node reports as object_id (that number is the fractal
+   slot). Preview. The hybrid runs its fractal children in sibling order. Each
+   child's formula_iterations is how many times that formula repeats before the
+   next child. 1 means once. 8 makes that formula dominate. A primitive cannot
+   be a child of a hybrid.
 
-Boolean add, subtract, and intersect are also objects-tree nodes. You can name
-them and explain the idea (add sticks shapes together, subtract carves, intersect
-keeps only the overlap). You cannot build the tree with this slice.
+4. Boolean. add_object type boolean_add (union), boolean_mul (overlap only), or
+   boolean_sub (carve later children out of the first). Children can be fractal
+   nodes or primitives. add_object type primitive, primitive sphere, parent_id
+   of the boolean, optional radius. boolean_sub carves the later siblings out of
+   the first child, so put the thing you want to keep first.
 
 ## Camera, in this order
 
@@ -71,11 +75,44 @@ the user's settings stay. iteration_fog_enable is different: it is a cheap color
 fog and it is often the whole look. glow_enabled is the cheap halo that is on
 by default. brightness and gamma fix a picture that is the right shape but dark.
 
-## Lights
+## Looks
 
-main_light_intensity, main_light_alpha (horizontal degrees), and main_light_beta
-(vertical degrees) are the key light. Raise intensity before you touch exposure
-if the shape is a silhouette.
+set_material id 1 is the default surface. surface_color is a flat color
+(#rrggbb or [r, g, b]). use_colors_from_palette with surface_color_gradient
+(a string like "0 fd6029 999 698403") is the orbit palette. A fresh session has
+no material 1; previews define it on a copy so the PNG is not black. set_material
+defines it on the live session.
+
+The color you actually see is often iteration fog, not the material. Turn it on
+with set_parameters iteration_fog_enable true, and set iteration_fog_color_1
+to an [r, g, b] or #rrggbb. glow_enabled is the cheap halo and starts on.
+brightness and gamma fix a picture that is the right shape but dark.
+
+set_light id 1 is the key light. A fresh session has no lights defined; orbit
+coloring can still paint a Mandelbulb. Pass intensity (try 1 to 2) before you
+raise brightness. Passing position detaches the light from the camera. Colors
+are #rrggbb or [r, g, b].
+
+## Animation
+
+Keyframe sketch: set_camera, add_keyframe (frames_per_keyframe defaults to 4
+here; the app's own default of 100 is a long final, not a sketch), move the
+camera a small amount, add_keyframe again. Two keys at 4 produce 5 interpolated
+frames, because the last key contributes one frame. Camera, target, and fov
+use Akima interpolation. render_animation mode keyframe, quality draft,
+long_side 160, and a short start/end. It returns a job id immediately. Poll
+render_status until done is true. Frames are frame_NNNN.png in the output
+directory. get_image max_edge 320 returns the latest frame as a PNG.
+
+Orbit: set_flight_path kind orbit, count 8 (or whatever fits the sketch). That
+replaces the flight path and does not touch keyframes. The camera circles the
+target. render_animation mode flight. A fly-through is kind flythrough with
+start and end. Keep the target on the shape or the frames are empty.
+
+stop_render sets the stop flag. There is no confirmation dialog. Do not start
+a second render while render_running is true.
+
+## Numbers
 
 ## Numbers
 
@@ -94,14 +131,18 @@ and it refuses the shared examples directory. Say that out loud before you save
 over a user's file.
 
 undo and redo step through session edits since this connection attached. Each
-set_parameters, set_formula, and load is one step.
+set_parameters, set_formula, tree edit, material, light, camera, keyframe,
+flight path, and load is one step.
 
 ## How to behave
 
 Call get_state before the first edit so you know what is already on screen.
 Call describe_formula or describe_parameter before you set a name you have not
-seen in this text. If a preview is nearly black, check glow, brightness, and
-whether the camera is inside the set before you raise detail_level. If a render
-is already running in the open window, render_preview will refuse; tell the
-user to wait or stop it there.
+seen in this text. If a preview is nearly black, check the Mandelbox scale,
+glow, brightness, and whether the camera is inside the set before you raise
+detail_level. render_preview still returns a PNG, and the window stays
+responsive while it runs. If a render is already running, it will refuse; poll
+render_status, or call stop_render. A full still is render_still, which returns
+a job id instead of waiting. Cap sketches: long_side at most 640 on a draft,
+and keep animation ranges short. The default animation cap is 24 frames.
 """.strip()

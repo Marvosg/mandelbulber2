@@ -28,6 +28,9 @@ public:
 
 	// Returns false when another live instance already owns the socket.
 	bool Start();
+	// Undo baseline. Called after autosave recovery so the first undo is the
+	// scene the user actually kept, not the empty one from before the dialog.
+	void NoteBaseline();
 
 private slots:
 	void OnNewConnection();

@@ -218,21 +218,11 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	// write parameters to ui
-	bool dataFoldersUpdated = false;
-	if (!commandLineInterface.isNoGUI())
-	{
-		gMainInterface->ComboMouseClickUpdate();
-		gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::write);
-		gMainInterface->ComboMouseClickUpdate();
-		// dataFoldersUpdated = gMainInterface->DataFolderUpgrade(); //obsolete function
-		bool recovered = gMainInterface->AutoRecovery();
-		if (!recovered) gMainInterface->LoadDefaultSettings();
-		gMainInterface->InitPeriodicRefresh();
-	}
-
+	// The socket starts before the autosave-recovery dialog. That dialog runs a
+	// nested event loop, and the server has to answer while it is on screen.
+	// The undo baseline is taken after the dialog, so the first undo is the
+	// scene the user kept.
 	gInterfaceReadyForSynchronization = true;
-
 	gUndo = new cUndo(gMainInterface);
 
 	if (!commandLineInterface.isNoGUI() || commandLineInterface.isMcp())
@@ -246,10 +236,21 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	// write parameters to ui
+	bool dataFoldersUpdated = false;
 	if (!commandLineInterface.isNoGUI())
 	{
+		gMainInterface->ComboMouseClickUpdate();
+		gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::write);
+		gMainInterface->ComboMouseClickUpdate();
+		// dataFoldersUpdated = gMainInterface->DataFolderUpgrade(); //obsolete function
+		bool recovered = gMainInterface->AutoRecovery();
+		if (!recovered) gMainInterface->LoadDefaultSettings();
+		gMainInterface->InitPeriodicRefresh();
 		gMainInterface->mainWindow->slotPopulateToolbar();
 	}
+
+	if (gMcpServer) gMcpServer->NoteBaseline();
 
 	commandLineInterface.ProcessCLI();
 
