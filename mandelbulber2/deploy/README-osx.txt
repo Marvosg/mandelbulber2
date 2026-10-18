@@ -1,5 +1,37 @@
 
-                              MANDELBULBER 2.30
+                              MANDELBULBER 2.35
+
+0. Current macOS build (Qt 6)
+-----------------------------
+
+The steps below this section are the old Qt 5 / hand-built dependency notes.
+Do not follow them. CircleCI already builds with Homebrew Qt 6.
+
+    brew install llvm qt gsl lzo jpeg libpng libtiff libsndfile
+
+`qt` from Homebrew is Qt 6. Clone Khronos OpenCL-CLHPP and copy include/CL
+so cl.hpp exists. OpenCL.framework supplies the library; do not link -lOpenCL.
+
+From mandelbulber2/qmake:
+
+    Apple Silicon:  qmake mandelbulber-opencl-m1.pro
+                    C++17, deployment target 12.0, /opt/homebrew, OpenMP off
+    Intel:          qmake mandelbulber-opencl-mac.pro
+                    C++14, clang from /usr/local/opt/llvm
+
+Then make, then:
+
+    macdeployqt mandelbulber2.app -dmg
+
+macos.pri copies formula, examples, materials, icons, sounds, textures,
+toolbar, data, language, opencl, and doc into Contents/Resources. The MCP
+socket is compiled into the binary. The Python adapter in mcp/ is installed
+separately with uv or pip and is not part of the dmg. See mcp/README.md
+for Cursor and Claude Desktop config.
+
+New source files under src/ are picked up by qmake's src/*.cpp wildcard only
+after you run qmake again.
+
 
 1. What is Mandelbulber
 -----------------------

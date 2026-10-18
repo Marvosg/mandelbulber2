@@ -75,6 +75,11 @@ cCommandLineInterface::cCommandLineInterface(QCoreApplication *_qApplication)
 	const QCommandLineOption noguiOption(QStringList({"n", "nogui"}),
 		QCoreApplication::translate("main", "Starts the program without a GUI."));
 
+	const QCommandLineOption mcpOption("mcp",
+		QCoreApplication::translate("main",
+			"Starts a headless session and listens for a local MCP adapter on a user socket. "
+			"Does not render or exit. A settings file on the command line is loaded first."));
+
 	const QCommandLineOption keyframeOption(QStringList({"K", "keyframe"}),
 		QCoreApplication::translate("main", "Renders keyframe animation."));
 
@@ -201,6 +206,7 @@ cCommandLineInterface::cCommandLineInterface(QCoreApplication *_qApplication)
 			"<settings_file> can also be specified as a list, see all options with --help-input"));
 
 	parser.addOption(noguiOption);
+	parser.addOption(mcpOption);
 	parser.addOption(outputOption);
 	parser.addOption(logFilepathOption);
 	parser.addOption(keyframeOption);
@@ -241,6 +247,12 @@ cCommandLineInterface::cCommandLineInterface(QCoreApplication *_qApplication)
 	}
 
 	cliData.nogui = parser.isSet(noguiOption);
+	cliData.mcp = parser.isSet(mcpOption);
+	if (cliData.mcp)
+	{
+		cliData.nogui = true;
+		systemData.noGui = true;
+	}
 	cliData.keyframe = parser.isSet(keyframeOption);
 	cliData.flight = parser.isSet(flightOption);
 	cliData.silent = parser.isSet(silentOption);
@@ -373,12 +385,18 @@ void cCommandLineInterface::ReadCLI()
 	// show opencl help only (requires previous handling of override parameters)
 	if (cliData.showOpenCLHelp) printOpenCLHelpAndExit();
 
-	if (!settingsSpecified && cliData.nogui && cliOperationalMode != modeNetrender)
+	if (!settingsSpecified && cliData.nogui && !cliData.mcp && cliOperationalMode != modeNetrender)
 	{
 		cErrorMessage::showMessage(
 			QObject::tr("You have to specify a settings file, for this configuration!"),
 			cErrorMessage::errorMessage);
 		parser.showHelp(cliErrorSettingsFileNotSpecified);
+	}
+
+	if (cliData.mcp)
+	{
+		cliOperationalMode = modeMcp;
+		return;
 	}
 
 	if (cliData.nogui && cliOperationalMode != modeKeyframe && cliOperationalMode != modeFlight
@@ -439,6 +457,11 @@ void cCommandLineInterface::ProcessCLI() const
 		case modeBootOnly:
 		{
 			// nothing to be done
+			break;
+		}
+		case modeMcp:
+		{
+			// The socket is already listening. main() runs the event loop.
 			break;
 		}
 	}

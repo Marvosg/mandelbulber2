@@ -54,7 +54,8 @@ public:
 		modeFlight,
 		modeStill,
 		modeQueue,
-		modeVoxel
+		modeVoxel,
+		modeMcp
 	};
 	enum cliErrors
 	{
@@ -90,6 +91,7 @@ public:
 	void ReadCLI();
 	void ProcessCLI() const;
 	bool isNoGUI() const { return cliData.nogui; }
+	bool isMcp() const { return cliData.mcp; }
 
 private:
 	// ## helper methods for ReadCLI
@@ -121,6 +123,7 @@ private:
 	struct sCliData
 	{
 		bool nogui;
+		bool mcp;
 		bool server;
 		bool listParameters;
 		bool showInputHelp;

@@ -1,8 +1,10 @@
-# Mandelbulber2 MCP — phase 1 design
+# Mandelbulber2 MCP
 
-This is a design note only. No MCP code is in this branch.
+Phase 2 of this note is in the tree. The app listens on a local socket (`src/mcp_server.cpp`, `src/mcp_catalog.cpp`, `mandelbulber2 --mcp`). The official Python MCP SDK adapter is `mcp/` and speaks stdio. Install and client config are in `mcp/README.md`.
 
-The goal is the same shape as Blender MCP: an agent connected to the Mandelbulber the user already has open, able to set up formulas, camera, lighting, materials, effects, animation, and renders, and able to look at a cheap preview before committing to a long render. The user will not know parameter names, so the tools have to teach the agent.
+The eight decisions in the last section are accepted as written: Python bridge, official MCP SDK, stdio plus `QLocalServer`, Cursor and Claude Desktop on the same machine, attach or launch `--mcp`, live-session edits with one undo step and widget sync, the dmg contains only the app, and this change is the core slice only.
+
+The goal is the same shape as Blender MCP: an agent connected to the Mandelbulber the user already has open, able to set up formulas, camera, lighting, materials, effects, animation, and renders, and able to look at a cheap preview before committing to a long render. The user will not know parameter names, so the tools have to teach the agent. Materials, the objects tree, keyframes, flight, and full render jobs are still the next slice.
 
 ## How the program is put together
 
@@ -20,7 +22,7 @@ Rough layout:
 | Per-formula widgets, icons, OpenCL kernels | `mandelbulber2/formula/ui`, `img`, `opencl` |
 | Examples, materials, textures, icons | `mandelbulber2/deploy/share/mandelbulber2/` |
 
-Startup (`src/main.cpp`) builds one main parameter container (`gPar`) and nine fractal containers (`gParFractal`, slots 0–8, shown to the user as fractal 1–9). It fills them from `InitParams` / `InitFractalParams`, builds the formula list, then either shows the GUI or runs a CLI action and exits. A settings file on the command line forces no-GUI mode.
+Startup (`src/main.cpp`) builds one main parameter container (`gPar`) and nine fractal containers (`gParFractal`, slots 0–8, shown to the user as fractal 1–9). It fills them from `InitParams` / `InitFractalParams`, builds the formula list, then either shows the GUI or runs a CLI action and exits. `--mcp` forces headless mode, loads an optional settings file, and stays in the Qt event loop instead of rendering a still and exiting. A settings file without `--mcp` or `--nogui` still opens the GUI.
 
 ### Parameters
 
@@ -186,14 +188,20 @@ Long renders should also emit MCP progress notifications from the Python server,
 
 ### What the first implementation slice should contain
 
-The design above is the whole project. The first coding slice should still be end-to-end, but narrow:
+This slice is implemented.
 
-1. Socket, session file, GUI-thread dispatch, undo, widget sync.
-2. `list_formulas`, `describe_formula`, `list_parameters`, `get_guidance`, `get_state`, `set_parameters`, `set_formula`.
-3. `render_preview` and `get_image` returning real PNGs.
-4. `load_example`, `load_settings`, `save_settings`, `undo`.
+1. Socket, session file, GUI-thread dispatch, undo (`cUndo::CommitNow`), widget sync.
+2. `list_formulas`, `describe_formula`, `list_parameters`, `describe_parameter`, `get_guidance`, `get_state`, `set_parameters`, `set_formula`.
+3. `render_preview` and `get_image` returning real PNGs. The preview is a copy: it caps `detail_level`, turns off ambient occlusion, depth of field, volumetric fog, ray-traced reflections, and Monte Carlo global illumination, and defines material 1 when the session has none so the PNG is not black. The session itself is not changed.
+4. `load_example`, `load_settings`, `save_settings`, `undo`, `redo`.
 
-Objects-tree helpers, materials, keyframes, and flight use the same socket and should follow immediately after that slice is proven against a live GUI (xvfb) and against `--mcp`. Doing all of them before the socket and the catalog work just multiplies the ways a widget sync bug can hide.
+`widget_roundtrip` is a socket method, not an MCP tool. It reads the widgets back into the session the way a GUI render does, so a test can prove an edit survived that read-back.
+
+The stored default `mandelbox_scale` is 2. From the default camera that value draws an empty frame. `get_guidance` tells the agent to set `mandelbox_scale` to -1.5, which is the classic Amazing Box and does show up.
+
+Numbers from the socket are parsed in the C locale. A string with one decimal comma and no dot is accepted. A token that contains both separators is rejected. `cMultiVal::Store(QString)` still uses the system locale; the MCP path does not call it.
+
+Objects-tree helpers, materials, keyframes, and flight use the same socket and are the next slice.
 
 ## macOS build plan
 

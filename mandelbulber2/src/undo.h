@@ -66,6 +66,11 @@ public:
 	bool Redo(std::shared_ptr<cParameterContainer> par, std::shared_ptr<cFractalContainer> parFractal,
 		std::shared_ptr<cAnimationFrames> frames, std::shared_ptr<cKeyframes> keyframes,
 		bool *refreshFrames, bool *refreshKeyframes);
+	// Store() waits 500ms before the snapshot becomes an undo step. MCP edits
+	// commit immediately so one call is one undo step.
+	void CommitNow();
+	bool CanUndo() const { return level > 1; }
+	bool CanRedo() const { return level < undoBuffer.size(); }
 
 private slots:
 	void slotDelayedStore();
