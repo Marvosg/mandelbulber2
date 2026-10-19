@@ -71,6 +71,7 @@ public:
 private slots:
 	void slotStartRender();
 	void slotStopRender();
+	void slotAutoRefreshClicked(bool checked);
 
 	void slotCameraMove();
 	void slotCameraRotation();

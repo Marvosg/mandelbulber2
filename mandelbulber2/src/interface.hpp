@@ -104,8 +104,14 @@ public:
 	void ResetFormula(int fractalNumber) const;
 	void PeriodicRefresh();
 	void DisablePeriodicRefresh();
-	void ReEnablePeriodicRefresh();
+	void ReEnablePeriodicRefresh(bool captureHash = true);
 	void InitPeriodicRefresh();
+	// User preference. Saved in the application ini, independent of the loaded preset.
+	void SetAutoRefreshEnabled(bool enabled);
+	// Viewport render for the current scene. Skips when that scene is already rendering.
+	void RenderViewportIfAutoRefresh();
+	// Post-effect edits should not clear the preference or start a fractal render.
+	void AbsorbAutoRefreshChanges();
 	void InitMaterialsUi();
 	void MaterialSelected(int matIndex);
 	static void StartupDefaultSettings();
@@ -148,7 +154,8 @@ public:
 	QTimer *stopRequestPulseTimer;
 	QElapsedTimer timerForAbortWarnings;
 	QString autoRefreshLastHash;
-	bool autoRefreshLastState;
+	int autoRefreshPauseCount;
+	void CaptureAutoRefreshHash();
 	cMaterialItemModel *materialListModel;
 	cMaterialEditor *materialEditor;
 	QWidget *scrollAreaMaterialEditor;
@@ -169,5 +176,21 @@ private slots:
 };
 
 extern cInterface *gMainInterface;
+
+// Pauses the auto-refresh timer for the lifetime of this object without
+// changing the checkbox or the saved preference.
+class cAutoRefreshPause
+{
+public:
+	// captureHashOnRelease records the scene so the timer does not render it.
+	// Preset loads pass false, then start a viewport render themselves.
+	explicit cAutoRefreshPause(bool captureHashOnRelease = true);
+	~cAutoRefreshPause();
+	cAutoRefreshPause(const cAutoRefreshPause &) = delete;
+	cAutoRefreshPause &operator=(const cAutoRefreshPause &) = delete;
+
+private:
+	bool captureHashOnRelease;
+};
 
 #endif /* MANDELBULBER2_SRC_INTERFACE_HPP_ */

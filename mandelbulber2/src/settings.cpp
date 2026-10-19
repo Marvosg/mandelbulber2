@@ -1042,6 +1042,9 @@ bool cSettings::DecodeOneLine(std::shared_ptr<cParameterContainer> par, QString 
 	parameterName = stripEnclosingQuotes(parameterName);
 	value = stripEnclosingQuotes(value);
 
+	// One global preference, stored in the application ini. A preset must not change it.
+	if (parameterName == "auto_refresh" && format != formatAppSettings) return true;
+
 	// Extract optional script portion (after the second semicolon)
 	if (semicolon < line.length() - 2)
 	{

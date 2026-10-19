@@ -45,6 +45,7 @@
 #include <memory>
 
 #include <QElapsedTimer>
+#include <QImage>
 #include <QWidget>
 
 // forward declarations
@@ -69,7 +70,11 @@ public:
 	void DisableRenderOnPaint() { disableRenderOnPaint = true; }
 	void DisableThumbnailCache() { disableThumbnailCache = true; }
 	void SetSettingsFile(const QString &file) { settingsFile = file; }
+	void SetCornerRadius(int radius);
+	QImage displayedPreview();
 	bool IsRendered() const { return isFullyRendered; }
+	// Parameters are still attached, so a caller can render without waiting for the idle timer.
+	bool CanRenderNow() const { return !isFullyRendered && image && params; }
 	std::shared_ptr<cImage> GetImage() { return image; };
 	QString GetThumbnailFileName() const;
 	void StopRequest() { stopRequest = true; }
@@ -83,6 +88,7 @@ private:
 private slots:
 	void slotFullyRendered();
 	void slotRandomRender();
+	void slotPreviewChanged();
 
 public slots:
 	void slotSetMinimumSize(int width, int height);
@@ -107,6 +113,11 @@ private:
 	bool disableRenderOnPaint = false;
 	bool disableThumbnailCache;
 	bool useForrandomizer;
+	int cornerRadius;
+	QImage previewCache;
+	int previewCacheRadius = -1;
+	qreal previewCacheDpr = 0;
+	QSize previewCacheSize;
 	QString settingsFile;
 	// timer for random trigger for rendering (renders thumbnail even when is not visible)
 	QTimer *timer;

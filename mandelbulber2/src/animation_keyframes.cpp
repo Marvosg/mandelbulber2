@@ -961,7 +961,7 @@ void cKeyframeAnimation::UpadeProgressInformation(
 
 bool cKeyframeAnimation::RenderKeyframes(bool *stopRequest)
 {
-	mainInterface->DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	if (image->IsUsed())
 	{

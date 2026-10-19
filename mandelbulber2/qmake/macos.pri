@@ -1,4 +1,7 @@
 ROOT = $$PWD/..
+
+# AppKit helpers for placing drag windows over the unified toolbar.
+SOURCES += $$ROOT/qt/*.mm
 SHARED = $$ROOT/deploy/share/mandelbulber2
 
 CONFIG += app_bundle
