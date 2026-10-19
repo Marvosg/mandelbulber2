@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import atexit
+import time
 
-from mcp.server.mcpserver import Image, MCPServer
+from mcp.server.mcpserver import Context, Image, MCPServer
 
-from .bridge import Bridge
+from .bridge import Bridge, call_detached
 from .guidance import GUIDANCE
 
 server = MCPServer("mandelbulber")
@@ -29,16 +31,93 @@ def _call(method: str, params: dict | None = None, timeout: float = 180) -> str:
         return f"Error: {exc}"
 
 
+def _has_progress_token(ctx: Context) -> bool:
+    try:
+        meta = ctx.request_context.meta
+    except (AttributeError, ValueError, LookupError):
+        return False
+    if not meta:
+        return False
+    token = None
+    if isinstance(meta, dict):
+        token = meta.get("progress_token", meta.get("progressToken"))
+    else:
+        token = getattr(meta, "progress_token", None)
+        if token is None:
+            token = getattr(meta, "progressToken", None)
+    return token is not None and not isinstance(token, bool)
+
+
+async def _report(ctx: Context, progress: float, message: str) -> None:
+    try:
+        await ctx.report_progress(progress, 1.0, message or None)
+    except (RuntimeError, ValueError, ConnectionError, OSError):
+        return
+
+
+async def _await_job(ctx: Context, started: dict) -> dict:
+    """Poll until the job finishes, emitting MCP progress when a token was supplied.
+
+    Without a token the caller returns the job id immediately and the agent uses
+    render_status. With a token this waits and returns the final status.
+    """
+
+    job_id = str(started.get("id") or "")
+    if not job_id or not _has_progress_token(ctx):
+        return started
+    await _report(ctx, float(started.get("progress") or 0), str(started.get("message") or "started"))
+    last = -1.0
+    deadline = time.monotonic() + 1800
+    while time.monotonic() < deadline:
+        status = await asyncio.to_thread(bridge.call, "render_status", {"id": job_id}, 30)
+        progress = float(status.get("progress") or 0)
+        message = str(status.get("message") or status.get("status") or "")
+        done = bool(status.get("done")) or status.get("status") in {"finished", "stopped", "failed"}
+        if abs(progress - last) > 1e-6 or done:
+            await _report(ctx, 1.0 if done else progress, message)
+            last = progress
+        if done:
+            return status
+        await asyncio.sleep(0.25)
+    raise RuntimeError(
+        "The render did not finish within 30 minutes. Call render_status with its id."
+    )
+
+
+async def _preview_with_progress(ctx: Context, params: dict) -> dict:
+    task = asyncio.create_task(asyncio.to_thread(bridge.call, "render_preview", params, 300))
+    await _report(ctx, 0.0, "starting")
+    last = -1.0
+    while not task.done():
+        status: dict | None = None
+        try:
+            status = await asyncio.to_thread(call_detached, "render_status", None, 15)
+        except (RuntimeError, ConnectionError, OSError, TimeoutError):
+            status = None
+        if isinstance(status, dict):
+            progress = float(status.get("progress") or 0)
+            if progress != last:
+                await _report(ctx, progress, str(status.get("message") or ""))
+                last = progress
+        try:
+            await asyncio.wait_for(asyncio.shield(task), 0.3)
+        except asyncio.TimeoutError:
+            pass
+    result = await task
+    await _report(ctx, 1.0, "finished")
+    return result
+
+
 @server.tool()
 def get_guidance() -> str:
     """Teach a beginner before touching a parameter.
 
     Read this first when the user does not know fractal vocabulary. It has
-    recipes for a Mandelbulb, a Mandelbox (scale -1.5, not the stored 2), a
-    hybrid stack, a boolean, a keyframe sketch, and an orbit, plus how color,
-    lights, and cheap effects fit together. Edits stay in the live session
-    until save_settings is given an explicit path. This text does not need
-    Mandelbulber to be running.
+    recipes for a Mandelbulb, a Mandelbox (scale -1.5, or frame_scene if a
+    preview is empty), a hybrid stack, a boolean, a keyframe sketch, and an
+    orbit, plus how color, lights, and cheap effects fit together. Edits stay
+    in the live session until save_settings is given an explicit path. This
+    text does not need Mandelbulber to be running.
     """
 
     return GUIDANCE
@@ -150,18 +229,17 @@ def set_formula(formula: str, slot: int = 1) -> str:
     """Put a formula in slot 1 to 9. One undo step.
 
     formula is the internal name (mandelbulb) or the display name (Mandelbulb).
-    Slot 1 is the default object and is what a fresh scene renders. The slot's
-    formula integer is what the ray marcher reads. The objects-tree label is
-    updated to match. Other slots do not appear in the picture until the tree
-    uses them. A Mandelbox kept at the stored scale of 2 is an empty frame from
-    the default camera; the starter recipe sets mandelbox_scale to -1.5.
+    Slot 1 is the shape a fresh scene draws. Other slots stay unused until the
+    objects tree points at them. A Mandelbox kept at the stored scale of 2 is
+    an empty frame from the default camera, because the eye is inside the
+    solid. Set mandelbox_scale to -1.5, or call frame_scene and preview again.
     """
 
     return _call("set_formula", {"formula": formula, "slot": slot})
 
 
 @server.tool(structured_output=False)
-def render_preview(quality: str = "draft", long_side: int = 320) -> list:
+async def render_preview(quality: str = "draft", long_side: int = 320, ctx: Context = None) -> list:
     """Render a small PNG and return the image.
 
     Uses a throwaway copy: the user's resolution, detail_level, and expensive
@@ -172,7 +250,9 @@ def render_preview(quality: str = "draft", long_side: int = 320) -> list:
     or better preview is never above 640. Aspect ratio is kept. Iteration fog
     and glow stay as they are, because they are often the look. Refuses while
     another render is running. Call this after every meaningful change and tell
-    the user what changed.
+    the user what changed. When the client sends a progress token, progress
+    notifications are reported while this waits. render_status remains the
+    fallback on a second look.
     """
 
     if quality == "draft" and long_side == 320:
@@ -180,7 +260,10 @@ def render_preview(quality: str = "draft", long_side: int = 320) -> list:
     else:
         params = {"quality": quality, "long_side": long_side}
     try:
-        result = bridge.call("render_preview", params, timeout=300)
+        if ctx is not None and _has_progress_token(ctx):
+            result = await _preview_with_progress(ctx, params)
+        else:
+            result = await asyncio.to_thread(bridge.call, "render_preview", params, 300)
     except (RuntimeError, ConnectionError, OSError) as exc:
         return [f"Error: {exc}"]
     path = result["path"]
@@ -385,7 +468,8 @@ def set_camera(
     """Move the eye. Vectors are [x, y, z]. fov is degrees. One undo step.
 
     The default eye is near [3, -6, 2], looking at [0, 0, 0]. Small moves,
-    then a preview. If the frame goes empty, put the target back on the shape.
+    then a preview. If the frame goes empty, call frame_scene before you
+    invent a new camera.
     """
 
     params: dict = {}
@@ -403,20 +487,42 @@ def set_camera(
 
 
 @server.tool()
-def render_still(
+def frame_scene(target: list | None = None) -> str:
+    """Pull the camera back until the shape fits in the frame. One undo step.
+
+    Use this when a preview is empty or nearly black and you have not moved
+    the camera on purpose. It measures the fractal and places the eye far
+    enough back to see the surface, keeping the current viewing direction.
+    target defaults to [0, 0, 0], which is where a fresh formula sits. It does
+    not change the formula. A Mandelbox left at scale 2 often needs this,
+    because the default camera is inside that solid; the other fix is
+    mandelbox_scale -1.5. Then render_preview.
+    """
+
+    params: dict = {}
+    if target is not None:
+        params["target"] = target
+    return _call("frame_scene", params)
+
+
+@server.tool()
+async def render_still(
     path: str = "",
     quality: str = "full",
     width: int = 0,
     height: int = 0,
     long_side: int = 0,
+    ctx: Context = None,
 ) -> str:
-    """Start a still render and return a job id immediately.
+    """Start a still render.
 
     quality full keeps the session's detail and effects, on a copy, so the open
     file's settings are not rewritten. quality draft caps detail at 0.5 and
     turns the expensive effects off. long_side above 0 rescales and is capped
-    at 640 for a draft and 4096 for full. Poll render_status. get_image returns
-    a PNG once the file exists. stop_render sets the stop flag with no dialog.
+    at 640 for a draft and 4096 for full. Without a progress token this returns
+    a job id immediately; poll render_status and fetch the PNG with get_image.
+    With a progress token it reports progress and returns the final status.
+    stop_render sets the stop flag with no dialog.
     """
 
     params: dict = {"quality": quality}
@@ -428,7 +534,12 @@ def render_still(
         params["height"] = height
     if long_side:
         params["long_side"] = long_side
-    return _call("render_still", params)
+    try:
+        started = await asyncio.to_thread(bridge.call, "render_still", params, 60)
+        finished = await _await_job(ctx, started) if ctx is not None else started
+        return _dump(finished)
+    except (RuntimeError, ConnectionError, OSError) as exc:
+        return f"Error: {exc}"
 
 
 @server.tool()
@@ -540,7 +651,7 @@ def set_flight_path(
 
 
 @server.tool()
-def render_animation(
+async def render_animation(
     mode: str = "keyframe",
     start: int = 0,
     end: int = 0,
@@ -550,14 +661,22 @@ def render_animation(
     max_frames: int = 24,
     width: int = 0,
     height: int = 0,
+    contact_sheet: bool = False,
+    frame_edge: int = 96,
+    columns: int = 0,
+    ctx: Context = None,
 ) -> str:
-    """Start a keyframe or flight render. Returns a job id immediately.
+    """Start a keyframe or flight render.
 
     mode is keyframe or flight. end 0 means through the last frame. quality
     defaults to draft. long_side defaults to 160 so a sketch stays small; pass
     0 only when you also pass width and height. The range is refused when it is
     longer than max_frames (default 24, hard maximum 500). Frames are written
-    as frame_NNNN.png. Poll render_status and pull frames with get_image.
+    as frame_NNNN.png. Without a progress token this returns a job id
+    immediately; poll render_status. With a progress token it reports progress
+    and returns the final status. contact_sheet true writes one thumbnail PNG
+    when the job ends. get_contact_sheet builds that strip on demand. get_image
+    returns a single frame.
     """
 
     params: dict = {
@@ -565,7 +684,11 @@ def render_animation(
         "start": start,
         "quality": quality,
         "max_frames": max_frames,
+        "contact_sheet": contact_sheet,
+        "frame_edge": frame_edge,
     }
+    if columns:
+        params["columns"] = columns
     if end:
         params["end"] = end
     if directory:
@@ -575,7 +698,36 @@ def render_animation(
         params["height"] = height
     elif long_side:
         params["long_side"] = long_side
-    return _call("render_animation", params, timeout=60)
+    try:
+        started = await asyncio.to_thread(bridge.call, "render_animation", params, 60)
+        finished = await _await_job(ctx, started) if ctx is not None else started
+        return _dump(finished)
+    except (RuntimeError, ConnectionError, OSError) as exc:
+        return f"Error: {exc}"
+
+
+@server.tool(structured_output=False)
+def get_contact_sheet(id: str = "", frame_edge: int = 96, columns: int = 0) -> list:
+    """One PNG that tiles an animation's frames so you can review them together.
+
+    Pass the job id from render_animation, or omit it for the latest job that
+    has frames. frame_edge is the thumbnail size, from 16 to 320. columns 0
+    lays out up to 6 across. The real frames stay as frame_NNNN.png. Use this
+    instead of opening every frame.
+    """
+
+    params: dict = {"frame_edge": frame_edge}
+    if id:
+        params["id"] = id
+    if columns:
+        params["columns"] = columns
+    try:
+        result = bridge.call("get_contact_sheet", params)
+    except (RuntimeError, ConnectionError, OSError) as exc:
+        return [f"Error: {exc}"]
+    data = open(result["path"], "rb").read()
+    note = _dump({key: value for key, value in result.items() if key != "path"})
+    return [note, Image(data=data, format="png")]
 
 
 @server.tool()
@@ -610,7 +762,14 @@ def save_settings(path: str, overwrite: bool = False) -> str:
 
 @server.tool()
 def undo() -> str:
-    """Undo the last session edit (parameters, formula, tree, look, animation, or a load)."""
+    """Undo the last edit made in this Mandelbulber process.
+
+    Stops at the scene from when this process finished starting (after autosave
+    recovery, if that dialog was answered). It does not walk undo files left by
+    an older session. The window's Undo menu can still reach those. Each MCP
+    edit is one step: parameters, formula, tree, look, camera, animation, or a
+    load.
+    """
 
     return _call("undo")
 

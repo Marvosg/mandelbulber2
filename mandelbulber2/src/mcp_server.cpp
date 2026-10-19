@@ -495,8 +495,26 @@ bool cMcpServer::Start()
 	const QString user = qEnvironmentVariable("USERNAME", "user");
 	socketPath = QString("mandelbulber2-%1").arg(user);
 #else
-	socketPath = systemDirectories.GetDataDirectoryHidden()
-							 + QString("mandelbulber2-%1.sock").arg(getuid());
+	// macOS sockaddr_un.sun_path is 104 bytes including the NUL (108 on Linux).
+	// ~/mandelbulber/mandelbulber2-<uid>.sock exceeds that for a long username.
+	// The session file stores the path actually used, so the adapter does not guess.
+	const QString preferred = systemDirectories.GetDataDirectoryHidden()
+														+ QString("mandelbulber2-%1.sock").arg(getuid());
+	if (preferred.toUtf8().size() < 100)
+	{
+		socketPath = preferred;
+	}
+	else
+	{
+		const QString inTemp = QDir::temp().filePath(QString("mandelbulber2-%1.sock").arg(getuid()));
+		socketPath = inTemp.toUtf8().size() < 100
+									 ? inTemp
+									 : QString("/tmp/mandelbulber2-%1.sock").arg(getuid());
+		WriteLog(QString("MCP socket path is %1 bytes; listening on %2")
+								 .arg(preferred.toUtf8().size())
+								 .arg(socketPath),
+			1);
+	}
 #endif
 
 	QFile existing(sessionPath);
@@ -536,6 +554,9 @@ void cMcpServer::NoteBaseline()
 	if (!gUndo || !gPar || !gParFractal || !gAnimFrames || !gKeyframes) return;
 	gUndo->Store(gPar, gParFractal, gAnimFrames, gKeyframes);
 	gUndo->CommitNow();
+	// Older undo files loaded at startup stay in the buffer for the window's
+	// Undo menu. MCP undo stops at this snapshot.
+	gUndo->SetSessionFloor();
 }
 
 void cMcpServer::WriteSessionFile()
@@ -628,6 +649,8 @@ QByteArray cMcpServer::HandleLine(const QByteArray &line)
 	{
 		response["ok"] = false;
 		response["error"] = result.value("error");
+		result.remove("ok");
+		if (!result.isEmpty()) response["result"] = result;
 	}
 	else
 	{
@@ -645,7 +668,7 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 	{
 		const QStringList allowed = {"get_session", "get_state", "list_formulas", "describe_formula",
 			"list_parameters", "describe_parameter", "list_examples", "get_objects_tree", "get_animation",
-			"get_image", "render_status", "stop_render"};
+			"get_image", "get_contact_sheet", "render_status", "stop_render"};
 		if (!allowed.contains(method))
 		{
 			return Fail("A render is already running. Poll render_status or get_image, or call "
@@ -883,7 +906,10 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		bool frames = false;
 		bool keyframes = false;
 		const bool isUndo = method == "undo";
-		if (isUndo && !gUndo->CanUndo()) return Fail("Nothing to undo in this session.");
+		if (isUndo && !gUndo->CanUndo())
+			return Fail("Nothing to undo in this session. Undo stops at the scene from when this "
+									"process finished starting, including after autosave recovery. The window's "
+									"Undo menu can still reach older files.");
 		if (!isUndo && !gUndo->CanRedo()) return Fail("Nothing to redo.");
 		const bool ok = isUndo ? gUndo->Undo(gPar, gParFractal, gAnimFrames, gKeyframes, &frames, &keyframes)
 													 : gUndo->Redo(gPar, gParFractal, gAnimFrames, gKeyframes, &frames, &keyframes);

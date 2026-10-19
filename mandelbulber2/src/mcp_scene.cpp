@@ -10,13 +10,16 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include <QCoreApplication>
 #include <QDir>
 #include <QEventLoop>
 #include <QFileInfo>
+#include <QHash>
 #include <QImage>
 #include <QJsonArray>
 #include <QMutex>
@@ -28,13 +31,18 @@
 
 #include "algebra.hpp"
 #include "animation_flight.hpp"
+#include "calculate_distance.hpp"
+#include "camera_target.hpp"
+#include "common_math.h"
 #include "animation_frames.hpp"
 #include "animation_keyframes.hpp"
 #include "cimage.hpp"
 #include "color_structures.hpp"
 #include "file_image.hpp"
 #include "fractal_container.hpp"
+#include "fractparams.hpp"
 #include "global_data.hpp"
+#include "hybrid_fractal_sequences.h"
 #include "initparameters.hpp"
 #include "interface.hpp"
 #include "keyframes.hpp"
@@ -42,6 +50,8 @@
 #include "objects_tree.h"
 #include "primitive_item.h"
 #include "primitives.h"
+#include "projection_3d.hpp"
+#include "render_data.hpp"
 #include "render_job.hpp"
 #include "render_window.hpp"
 #include "rendering_configuration.hpp"
@@ -73,6 +83,13 @@ struct sJob
 	double detailCap = 0;
 	bool draft = false;
 	bool stop = false;
+	// Socket-only. Set immediately before Execute so a stop that arrives
+	// before the render clears its flag is still honored.
+	bool stopBeforeExecute = false;
+	bool wantContactSheet = false;
+	int frameEdge = 96;
+	int columns = 0;
+	QString contactSheetPath;
 	std::atomic<bool> done{false};
 	QMutex mutex;
 	std::shared_ptr<cParameterContainer> par;
@@ -524,6 +541,7 @@ bool RenderOne(const std::shared_ptr<sJob> &job, const QString &basePath, QStrin
 	if (job->draft) ApplyDraftLimits(job->par, job->detailCap);
 	auto image = std::make_shared<cImage>(job->width, job->height);
 	cRenderJob renderJob(job->par, job->fractal, image, 1, &job->stop);
+	renderJob.PreserveStopRequest();
 	cRenderingConfiguration config;
 	config.DisableRefresh();
 	config.DisableProgressiveRender();
@@ -542,7 +560,15 @@ bool RenderOne(const std::shared_ptr<sJob> &job, const QString &basePath, QStrin
 			},
 			Qt::QueuedConnection);
 	}
-	if (!renderJob.Init(cRenderJob::still, config) || !renderJob.Execute())
+	if (!renderJob.Init(cRenderJob::still, config))
+	{
+		*error = QString("The render did not start.");
+		return false;
+	}
+	// After Init, before Execute clears the flag. A real stop_render that won
+	// this race is already true and is kept by PreserveStopRequest.
+	if (job->stopBeforeExecute) job->stop = true;
+	if (!renderJob.Execute())
 	{
 		*error = job->stop ? QString("The render was stopped.") : QString("The render did not finish.");
 		return false;
@@ -554,6 +580,64 @@ bool RenderOne(const std::shared_ptr<sJob> &job, const QString &basePath, QStrin
 		return false;
 	}
 	return true;
+}
+
+struct sSheet
+{
+	QString path;
+	int width = 0;
+	int height = 0;
+	int count = 0;
+};
+
+// Tiles finished frames into one PNG. No text, so a headless QCoreApplication
+// does not need a font. A short white mark keeps the grid readable.
+sSheet WriteContactSheet(const QStringList &paths, const QString &base, int frameEdge, int columns)
+{
+	sSheet sheet;
+	frameEdge = qBound(16, frameEdge, 320);
+	QVector<QImage> thumbs;
+	for (const QString &path : paths)
+	{
+		QImage image(path);
+		if (image.isNull()) continue;
+		image = image.convertToFormat(QImage::Format_RGB32)
+							 .scaled(frameEdge, frameEdge, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+		thumbs.append(image);
+	}
+	sheet.count = thumbs.size();
+	if (thumbs.isEmpty()) return sheet;
+	const int cols = columns > 0 ? qBound(1, columns, thumbs.size()) : qMin(thumbs.size(), 6);
+	const int rows = (thumbs.size() + cols - 1) / cols;
+	const int gap = 4;
+	sheet.width = cols * frameEdge + (cols + 1) * gap;
+	sheet.height = rows * frameEdge + (rows + 1) * gap;
+	QImage canvas(sheet.width, sheet.height, QImage::Format_RGB32);
+	canvas.fill(qRgb(24, 24, 28));
+	for (int i = 0; i < thumbs.size(); i++)
+	{
+		const QImage &thumb = thumbs.at(i);
+		const int col = i % cols;
+		const int row = i / cols;
+		const int ox = gap + col * (frameEdge + gap) + (frameEdge - thumb.width()) / 2;
+		const int oy = gap + row * (frameEdge + gap) + (frameEdge - thumb.height()) / 2;
+		for (int y = 0; y < thumb.height(); y++)
+		{
+			const QRgb *src = reinterpret_cast<const QRgb *>(thumb.constScanLine(y));
+			QRgb *dst = reinterpret_cast<QRgb *>(canvas.scanLine(oy + y));
+			memcpy(dst + ox, src, size_t(thumb.width()) * sizeof(QRgb));
+		}
+		for (int y = 0; y < 3; y++)
+		{
+			QRgb *dst = reinterpret_cast<QRgb *>(canvas.scanLine(oy + y));
+			const int mark = qMin(8, thumb.width());
+			for (int x = 0; x < mark; x++)
+				dst[ox + x] = qRgb(255, 255, 255);
+		}
+	}
+	sheet.path = base + ".png";
+	if (!canvas.save(sheet.path, "PNG")) sheet.path.clear();
+	return sheet;
 }
 
 void FinishJob(const std::shared_ptr<sJob> &job, const QString &status, const QString &error)
@@ -613,6 +697,24 @@ void RunAnimation(const std::shared_ptr<sJob> job, const QString &mode, int star
 		locker.unlock();
 		SetLastImage(saved);
 	}
+	if (job->wantContactSheet)
+	{
+		QStringList frames;
+		{
+			QMutexLocker locker(&job->mutex);
+			frames = job->frames;
+		}
+		if (!frames.isEmpty())
+		{
+			const QString base = QDir(job->outputDirectory).filePath("contact_sheet");
+			const sSheet sheet = WriteContactSheet(frames, base, job->frameEdge, job->columns);
+			if (!sheet.path.isEmpty())
+			{
+				QMutexLocker locker(&job->mutex);
+				job->contactSheetPath = sheet.path;
+			}
+		}
+	}
 	FinishJob(job, job->stop ? "stopped" : "finished", QString());
 }
 
@@ -643,6 +745,7 @@ QJsonObject JobStatus(const std::shared_ptr<sJob> &job)
 	if (!job->error.isEmpty()) result["error"] = job->error;
 	if (!job->outputDirectory.isEmpty()) result["output"] = job->outputDirectory;
 	if (!job->imagePath.isEmpty()) result["image"] = job->imagePath;
+	if (!job->contactSheetPath.isEmpty()) result["contact_sheet"] = job->contactSheetPath;
 	QJsonArray frames;
 	for (const QString &path : job->frames)
 		frames.append(path);
@@ -1143,6 +1246,113 @@ QJsonObject SetFlightPath(const QJsonObject &params)
 	return result;
 }
 
+QJsonObject FrameScene(const QJsonObject &params)
+{
+	if (!gPar || !gParFractal) return Fail("No session.");
+	CVector3 lookAt(0.0, 0.0, 0.0);
+	QString error;
+	if (params.contains("target") && !ParseVec3(params.value("target"), &lookAt, &error))
+		return Fail(error);
+
+	auto parTemp = std::make_shared<cParameterContainer>(*gPar);
+	parTemp->Set("limits_enabled", false);
+	parTemp->Set("interior_mode", false);
+	const QStringList names = parTemp->GetListOfParameters();
+	for (const QString &name : names)
+	{
+		if ((name.contains("primitive_plane") || name.contains("primitive_water")) && name.contains("enabled"))
+			parTemp->Set(name, false);
+	}
+
+	CVector3 camera = gPar->Get<CVector3>("camera");
+	CVector3 target = gPar->Get<CVector3>("target");
+	CVector3 top = gPar->Get<CVector3>("camera_top");
+	cCameraTarget cameraTarget(camera, target, top);
+	CVector3 forward = cameraTarget.GetForwardVector();
+	if (forward.Length() < 1e-8) forward = CVector3(0.0, -1.0, 0.0);
+	forward.Normalize();
+
+	const params::enumPerspectiveType persp =
+		params::enumPerspectiveType(parTemp->Get<int>("perspective_type"));
+	double fov = CalcFOV(parTemp->Get<double>("fov"), persp);
+	if (fov < 1e-4) fov = 1e-4;
+	double deFactor = parTemp->Get<double>("DE_factor");
+	if (deFactor < 0.01) deFactor = 1.0;
+
+	std::shared_ptr<sParamRender> renderParams(new sParamRender(parTemp));
+	cObjectsTree objectsTree;
+	objectsTree.CreateNodeDataFromParameters(parTemp);
+	std::vector<cObjectsTree::sNodeDataForRendering> nodes = objectsTree.GetNodeDataListForRendering();
+	cHybridFractalSequences fractals;
+	fractals.CreateSequences(parTemp, gParFractal, nodes);
+	sRenderData renderData;
+	renderData.nodesDataForRendering = nodes;
+	renderData.hybridFractalSequences = fractals;
+	const int depth = GetObjectTreeRequiredStackDepth(renderData.nodesDataForRendering);
+	std::vector<ObjectTreeStackFrame> objectStack(size_t(qMax(1, depth)));
+
+	const int rays = qBound(8, params.value("rays").toInt(36), 100);
+	double maxDist = 0.0;
+	for (int i = 0; i < rays; i++)
+	{
+		CVector3 direction(Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0);
+		if (direction.Length() < 1e-8) continue;
+		direction.Normalize();
+		double distStep = 1.0;
+		double scan = 100.0;
+		for (; scan > 0.0; scan -= distStep)
+		{
+			const CVector3 point = lookAt + direction * scan;
+			sDistanceIn in(point, 0, false);
+			sDistanceOut out;
+			const double dist =
+				CalculateDistance(*renderParams, fractals, in, &out, &renderData, &objectStack);
+			// A NaN distance would otherwise spin. Treat it as a hit and stop.
+			if (!(dist > 0.1)) break;
+			distStep = dist * deFactor * 0.5;
+			if (distStep > 1.0) distStep = 1.0;
+			if (distStep < 1e-3) distStep = 1e-3;
+		}
+		if (scan > maxDist) maxDist = scan;
+	}
+
+	if (maxDist < 0.05)
+	{
+		return Fail(
+			"Could not find a surface within the scan. The formula may be empty, the scale may have "
+			"collapsed the shape, or it sits far from the target. For a Mandelbox, set "
+			"mandelbox_scale to -1.5 (the stored default of 2 is a solid the default camera sits "
+			"inside). Or pass target where the shape should be, then call frame_scene again.");
+	}
+
+	double newDist;
+	if (persp == params::perspThreePoint)
+		newDist = maxDist / fov * 2.0 * std::sqrt(2.0);
+	else if (persp == params::perspEquirectangular)
+		newDist = maxDist / fov * 4.0;
+	else
+		newDist = maxDist / fov * 2.0;
+	if (newDist < 0.1) newDist = 0.1;
+
+	const CVector3 newCamera = lookAt + forward * newDist * (-1.0);
+	gPar->Set("target", lookAt);
+	gPar->Set("camera", newCamera);
+	gPar->Set("camera_distance_to_target", newDist);
+	gPar->Set("view_distance_max", (newDist + maxDist) * 2.0);
+	Remember();
+
+	QJsonObject result;
+	result["camera"] = QJsonArray{newCamera.x, newCamera.y, newCamera.z};
+	result["target"] = QJsonArray{lookAt.x, lookAt.y, lookAt.z};
+	result["distance"] = newDist;
+	result["measured_radius"] = maxDist;
+	result["note"] =
+		"The camera was pulled back until the measured surface fits the frame, looking at the "
+		"target. The viewing direction was kept. One undo step. The formula was not changed. "
+		"render_preview to check. If the frame is still empty, set mandelbox_scale to -1.5.";
+	return result;
+}
+
 QJsonObject RenderStill(const QJsonObject &params, bool waitForResult)
 {
 	if (RenderBusy())
@@ -1168,6 +1378,7 @@ QJsonObject RenderStill(const QJsonObject &params, bool waitForResult)
 	if (!PrepareCopy(params, job, &error)) return Fail(error);
 	job->outputDirectory = output;
 	job->frameCount = 1;
+	job->stopBeforeExecute = params.value("stop_before_execute").toBool(false);
 	const int width = job->width;
 	const int height = job->height;
 	const bool draft = job->draft;
@@ -1236,6 +1447,10 @@ QJsonObject RenderAnimation(const QJsonObject &params)
 	if (!PrepareCopy(params, job, &error)) return Fail(error);
 	job->outputDirectory = directory;
 	job->frameCount = end - start;
+	job->stopBeforeExecute = params.value("stop_before_execute").toBool(false);
+	job->wantContactSheet = params.value("contact_sheet").toBool(false);
+	job->frameEdge = qBound(16, params.value("frame_edge").toInt(96), 320);
+	job->columns = params.value("columns").toInt(0);
 	job->keyframes = std::make_shared<cKeyframes>(*gKeyframes);
 	job->flight = std::make_shared<cAnimationFrames>(*gAnimFrames);
 	Launch(job, mode, [mode, start, end](std::shared_ptr<sJob> live) {
@@ -1245,9 +1460,64 @@ QJsonObject RenderAnimation(const QJsonObject &params)
 	result["start"] = start;
 	result["end"] = end;
 	result["note"] =
-		"Frames are written as frame_NNNN.png. Poll render_status. get_image returns the latest "
-		"finished frame, downscaled if you pass max_edge. This uses a copy, so the open session's "
-		"resolution is unchanged. quality draft caps detail and turns the expensive effects off.";
+		"Frames are written as frame_NNNN.png. Poll render_status, or pass a progress token and this "
+		"call waits. get_image returns the latest finished frame, downscaled if you pass max_edge. "
+		"get_contact_sheet tiles the frames into one PNG. contact_sheet true also writes "
+		"contact_sheet.png when the job ends. This uses a copy, so the open session's resolution is "
+		"unchanged. quality draft caps detail and turns the expensive effects off.";
+	return result;
+}
+
+std::shared_ptr<sJob> FindJob(const QString &requested)
+{
+	if (!requested.isEmpty()) return gJobs.value(requested);
+	if (!gActiveJobId.isEmpty()) return gJobs.value(gActiveJobId);
+	std::shared_ptr<sJob> best;
+	int bestSerial = -1;
+	for (auto it = gJobs.constBegin(); it != gJobs.constEnd(); ++it)
+	{
+		const int serial = it.value()->id.mid(4).toInt();
+		if (serial < bestSerial) continue;
+		QMutexLocker locker(&it.value()->mutex);
+		if (it.value()->frames.isEmpty()) continue;
+		bestSerial = serial;
+		best = it.value();
+	}
+	return best;
+}
+
+QJsonObject GetContactSheet(const QJsonObject &params)
+{
+	const std::shared_ptr<sJob> job = FindJob(params.value("id").toString());
+	if (!job)
+		return Fail("No animation frames yet. render_animation first, then get_contact_sheet.");
+	QStringList frames;
+	QString directory;
+	{
+		QMutexLocker locker(&job->mutex);
+		frames = job->frames;
+		directory = job->outputDirectory;
+	}
+	if (frames.isEmpty())
+		return Fail("That job has no finished frames yet. Poll render_status, then try again.");
+	const int frameEdge = qBound(16, params.value("frame_edge").toInt(job->frameEdge), 320);
+	const int columns = params.value("columns").toInt(0);
+	const QString base = QDir(QDir::tempPath())
+												 .filePath(QString("mandelbulber-sheet-%1-%2")
+																			 .arg(QCoreApplication::applicationPid())
+																			 .arg(++gJobSerial));
+	const sSheet sheet = WriteContactSheet(frames, base, frameEdge, columns);
+	if (sheet.path.isEmpty()) return Fail("The frames were there but the contact sheet could not be written.");
+	QJsonObject result;
+	result["path"] = sheet.path;
+	result["width"] = sheet.width;
+	result["height"] = sheet.height;
+	result["frames"] = sheet.count;
+	result["id"] = job->id;
+	if (!directory.isEmpty()) result["output"] = directory;
+	result["note"] =
+		"One PNG of the finished frames, left to right. frame_edge is the thumbnail size. columns 0 "
+		"uses up to 6 across. This is for review; the frame_NNNN.png files are the real frames.";
 	return result;
 }
 
@@ -1288,6 +1558,7 @@ bool Dispatch(const QString &method, const QJsonObject &params, QJsonObject *res
 	else if (method == "set_material") *result = SetMaterial(params);
 	else if (method == "set_light") *result = SetLight(params);
 	else if (method == "set_camera") *result = SetCamera(params);
+	else if (method == "frame_scene") *result = FrameScene(params);
 	else if (method == "get_animation") *result = AnimationState();
 	else if (method == "add_keyframe") *result = AddKeyframe(params);
 	else if (method == "update_keyframe") *result = UpdateKeyframe(params);
@@ -1339,6 +1610,7 @@ bool Dispatch(const QString &method, const QJsonObject &params, QJsonObject *res
 			"or finished when the current tile or frame notices.";
 		*result = object;
 	}
+	else if (method == "get_contact_sheet") *result = GetContactSheet(params);
 	else if (method == "get_image")
 	{
 		QString path = LastImage();

@@ -111,6 +111,7 @@ cRenderJob::cRenderJob(const std::shared_ptr<cParameterContainer> _params,
 	renderData = nullptr;
 	useSizeFromImage = false;
 	stopRequest = _stopRequest;
+	preserveStopRequest = false;
 
 	id++;
 	// qDebug() << "Id" << id;
@@ -127,6 +128,15 @@ cRenderJob::~cRenderJob()
 	if (canUseNetRender) gNetRender->Release();
 
 	WriteLog("Job finished and closed", 2);
+}
+
+void cRenderJob::ResetStopFlag()
+{
+	if (!renderData || !renderData->stopRequest) return;
+	// PreserveStopRequest is MCP-only. A stop that arrived before Execute
+	// must still stop this job. GUI renders leave the flag false here.
+	if (preserveStopRequest && *renderData->stopRequest) return;
+	*renderData->stopRequest = false;
 }
 
 bool cRenderJob::Init(enumMode _mode, const cRenderingConfiguration &config)
@@ -387,7 +397,7 @@ bool cRenderJob::Execute()
 				// qDebug() << "runningJobs" << runningJobs;
 
 				inProgress = true;
-				*renderData->stopRequest = false;
+				ResetStopFlag();
 
 				WriteLog("cRenderJob::Execute(void): running jobs = " + QString::number(runningJobs), 2);
 
@@ -507,7 +517,7 @@ bool cRenderJob::Execute()
 			cProgressText progressText;
 			progressText.ResetTimer();
 
-			*renderData->stopRequest = false;
+			ResetStopFlag();
 
 			for (int repeat = 0; repeat < noOfRepeats; repeat++)
 			{
@@ -681,7 +691,7 @@ bool cRenderJob::Execute()
 		fractals->CreateSequences(paramsContainer, fractalContainer, nodes);
 		renderData->hybridFractalSequences = *fractals;
 
-		*renderData->stopRequest = false;
+		ResetStopFlag();
 
 		image->SetImageParameters(params->imageAdjustments);
 		image->SetFastPreview(true);

@@ -51,13 +51,43 @@ def mandelbulber_binary() -> str:
     override = os.environ.get("MANDELBULBER_BIN")
     if override:
         return override
-    for candidate in (
-        "/Applications/Mandelbulber2.app/Contents/MacOS/mandelbulber2",
-        str(Path.home() / "Applications/Mandelbulber2.app/Contents/MacOS/mandelbulber2"),
-    ):
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
+    names = ("Mandelbulber2.app", "mandelbulber2.app")
+    roots = (Path("/Applications"), Path.home() / "Applications")
+    for root in roots:
+        for name in names:
+            candidate = root / name / "Contents" / "MacOS" / "mandelbulber2"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
     return "mandelbulber2"
+
+
+# Qt QLocalServer::listen("name") on Windows is the pipe \\.\pipe\name.
+# macOS sockaddr_un.sun_path is 104 bytes including the NUL. The app falls
+# back when the preferred path is at least this many UTF-8 bytes. The session
+# file then carries the path that was actually opened.
+UNIX_SOCKET_PATH_LIMIT = 100
+
+
+def windows_pipe_path(name: str) -> str:
+    """Map a Qt local-server name to a Windows named-pipe path.
+
+    ``mandelbulber2-user`` becomes ``\\\\.\\pipe\\mandelbulber2-user``. A value
+    that is already a pipe path is returned in the backslash form CreateFileW
+    expects.
+    """
+
+    text = name.strip()
+    normalized = text.replace("/", "\\")
+    prefix = "\\\\.\\pipe\\"
+    if normalized.lower().startswith(prefix.lower()):
+        return prefix + normalized[len(prefix) :]
+    return prefix + text
+
+
+def unix_socket_path_too_long(path: str, limit: int = UNIX_SOCKET_PATH_LIMIT) -> bool:
+    """True when a Unix socket path may not fit in sockaddr_un on macOS."""
+
+    return len(path.encode("utf-8")) >= limit
 
 
 class Bridge:
@@ -65,7 +95,7 @@ class Bridge:
 
     def __init__(self) -> None:
         self.process: subprocess.Popen | None = None
-        self.socket: socket.socket | None = None
+        self.socket: _UnixTransport | _WindowsPipe | None = None
         self._buffer = b""
         self._next_id = 0
 
@@ -126,14 +156,9 @@ class Bridge:
 
     def _connect(self, name: str) -> None:
         if os.name == "nt":
-            raise RuntimeError(
-                "The Windows named-pipe client is not implemented in this slice. "
-                "The app still listens; use the Linux or macOS socket."
-            )
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(180)
-        sock.connect(name)
-        self.socket = sock
+            self.socket = _WindowsPipe(windows_pipe_path(name))
+        else:
+            self.socket = _UnixTransport(name)
         self._buffer = b""
 
     def call(self, method: str, params: dict | None = None, timeout: float = 180) -> dict:
@@ -160,3 +185,139 @@ class Bridge:
             raise RuntimeError(message.get("error") or "Mandelbulber rejected the command.")
         result = message.get("result")
         return result if isinstance(result, dict) else {"value": result}
+
+
+class _UnixTransport:
+    def __init__(self, path: str, timeout: float = 180) -> None:
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(timeout)
+        self._sock.connect(path)
+
+    def settimeout(self, timeout: float) -> None:
+        self._sock.settimeout(timeout)
+
+    def sendall(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def recv(self, size: int) -> bytes:
+        return self._sock.recv(size)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+class _WindowsPipe:
+    """Client for the named pipe Qt opens on Windows. Not used on Linux or macOS."""
+
+    def __init__(self, path: str, timeout: float = 180) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._timeout = timeout
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.WriteFile.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPCVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        kernel.WriteFile.restype = wintypes.BOOL
+        kernel.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        kernel.ReadFile.restype = wintypes.BOOL
+        kernel.PeekNamedPipe.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel.PeekNamedPipe.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        self._kernel = kernel
+        generic = 0x80000000 | 0x40000000  # GENERIC_READ | GENERIC_WRITE
+        handle = kernel.CreateFileW(path, generic, 0, None, 3, 0, None)  # OPEN_EXISTING
+        invalid = wintypes.HANDLE(-1).value
+        if handle is None or int(handle) in (0, int(invalid)):
+            err = ctypes.get_last_error()
+            raise ConnectionError(
+                f"Could not open the Mandelbulber pipe {path} (Windows error {err}). "
+                "Start Mandelbulber, or set MANDELBULBER_BIN so this adapter can launch it."
+            )
+        self._handle = handle
+
+    def settimeout(self, timeout: float) -> None:
+        self._timeout = timeout
+
+    def sendall(self, data: bytes) -> None:
+        written = self._ctypes.c_ulong(0)
+        buffer = self._ctypes.create_string_buffer(data)
+        ok = self._kernel.WriteFile(self._handle, buffer, len(data), self._ctypes.byref(written), None)
+        if not ok or written.value != len(data):
+            err = self._ctypes.get_last_error()
+            raise ConnectionError(f"Writing to the Mandelbulber pipe failed (Windows error {err}).")
+
+    def recv(self, size: int) -> bytes:
+        deadline = time.time() + self._timeout
+        available = self._ctypes.c_ulong(0)
+        while time.time() < deadline:
+            ok = self._kernel.PeekNamedPipe(
+                self._handle, None, 0, None, self._ctypes.byref(available), None
+            )
+            if not ok:
+                err = self._ctypes.get_last_error()
+                raise ConnectionError(f"The Mandelbulber pipe closed (Windows error {err}).")
+            if available.value:
+                to_read = min(size, int(available.value))
+                buffer = self._ctypes.create_string_buffer(to_read)
+                read = self._ctypes.c_ulong(0)
+                ok = self._kernel.ReadFile(self._handle, buffer, to_read, self._ctypes.byref(read), None)
+                if not ok:
+                    err = self._ctypes.get_last_error()
+                    raise ConnectionError(f"Reading the Mandelbulber pipe failed (Windows error {err}).")
+                return buffer.raw[: read.value]
+            time.sleep(0.02)
+        raise TimeoutError("Timed out waiting for Mandelbulber on the named pipe.")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
+
+
+def call_detached(method: str, params: dict | None = None, timeout: float = 30) -> dict:
+    """One command on a second connection. Used to poll status while a render holds the first."""
+
+    session = read_session()
+    if session is None or not session.get("socket"):
+        raise RuntimeError("No Mandelbulber session.")
+    client = Bridge()
+    client._connect(str(session["socket"]))
+    try:
+        return client.call(method, params, timeout=timeout)
+    finally:
+        if client.socket is not None:
+            try:
+                client.socket.close()
+            except OSError:
+                pass
+            client.socket = None

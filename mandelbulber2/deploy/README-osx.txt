@@ -1,40 +1,53 @@
 
                               MANDELBULBER 2.35
 
-0. Current macOS build (Qt 6)
------------------------------
+0. Current macOS build (Qt 6) and MCP setup
+--------------------------------------------
 
 The steps below this section are the old Qt 5 / hand-built dependency notes.
-Do not follow them. CircleCI already builds with Homebrew Qt 6.
+Do not follow them. CircleCI already builds with Homebrew Qt 6. The full
+click-by-click version, including Cursor and Claude Desktop, is in mcp/README.md
+under "macOS: build the app, then connect Cursor or Claude".
 
     brew install llvm qt gsl lzo jpeg libpng libtiff libsndfile
 
-`qt` from Homebrew is Qt 6. Clone Khronos OpenCL-CLHPP and copy include/CL
-so cl.hpp exists. OpenCL.framework supplies the library; do not link -lOpenCL.
+`qt` from Homebrew is Qt 6. Use $(brew --prefix qt)/bin/qmake and macdeployqt.
+Clone Khronos OpenCL-CLHPP and copy include/CL so cl.hpp exists (copy
+opencl.hpp to cl.hpp). OpenCL.framework supplies the library; do not link
+-lOpenCL. Put that CL directory on the qmake include path
+(-I<path-to-build> -DCL_SILENCE_DEPRECATION -DCL_TARGET_OPENCL_VERSION=120).
 
-From mandelbulber2/qmake:
+From a build directory, pointing qmake at mandelbulber2/qmake:
 
-    Apple Silicon:  qmake mandelbulber-opencl-m1.pro
+    Apple Silicon:  mandelbulber-opencl-m1.pro
                     C++17, deployment target 12.0, /opt/homebrew, OpenMP off
-    Intel:          qmake mandelbulber-opencl-mac.pro
-                    C++14, clang from /usr/local/opt/llvm
+    Intel:          mandelbulber-opencl-mac.pro
+                    C++14. CircleCI symlinks Homebrew LLVM to /usr/local/opt/llvm
 
 Then make, then:
 
     macdeployqt mandelbulber2.app -dmg
+
+The built bundle name is mandelbulber2.app (qmake TARGET). A renamed copy may
+be Mandelbulber2.app. The Python adapter checks both under /Applications and
+~/Applications. The binary inside is Contents/MacOS/mandelbulber2.
 
 macos.pri copies formula, examples, materials, icons, sounds, textures,
 toolbar, data, language, opencl, and doc into Contents/Resources. The MCP
 socket is compiled into the binary. data/mcp-dock-tooltips.json rides along
 in that data directory, so an installed app has the dock-widget descriptions
 without shipping qt/*.ui. The Python adapter in mcp/ is installed
-separately with uv or pip and is not part of the dmg. See mcp/README.md
-for Cursor and Claude Desktop config. The adapter can drive the objects
-tree, materials, lights, keyframes, flight paths, and still or animation
-renders. Point MANDELBULBER_BIN at Contents/MacOS/mandelbulber2.
+separately with uv or pip and is not part of the dmg.
+
+The app's data directory on macOS is ~/mandelbulber (not ~/.mandelbulber).
+The session file is ~/mandelbulber/mcp-session.json. macOS limits a Unix
+socket path to 104 bytes including the NUL. If the path under ~/mandelbulber
+is 100 bytes or longer, the app listens on a shorter temp path and writes
+that path into the session file.
 
 New source files under src/ are picked up by qmake's src/*.cpp wildcard only
-after you run qmake again.
+after you run qmake again. mcp_server.cpp and mcp_scene.cpp are already in
+that wildcard.
 
 
 1. What is Mandelbulber

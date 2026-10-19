@@ -105,7 +105,7 @@ Headless check, `QT_QPA_PLATFORM=offscreen`, no X server:
 - `mandelbulber001.fract` (comma decimals) at 200×112 produced a near-empty PNG. Cause: locale `en_US` versus a file written with decimal commas. Not a build failure.
 - `examples/Graeme McLaren collection .../mbulbPow2_v2.fract` (period decimals) at 240×240, with `detail_level`, ambient occlusion, and reflections turned down, finished in about 0.3 s and wrote a real fractal PNG to `/tmp/mb-pow2.png`.
 
-CLI statistics printed `Total number of iters: 0` even though the image has content. The progress counters are not flushed to that summary in this headless path. Do not trust that line when testing.
+CLI statistics used to print `Total number of iters: 0` because the objects-tree distance function never wrote `totalIters`. That assignment is in place. A 48×36 headless render of `mandelbulb001.fract` with `--stats` reported about 1.5e6 iterations.
 
 ## Recommended shape
 
@@ -213,7 +213,17 @@ Implemented in `src/mcp_scene.cpp` and the matching Python tools.
 - The socket is created before the autosave-recovery dialog. The undo baseline is stored after the dialog, so the first undo is the scene the user kept.
 - Keyframe and flight rendering does not call the GUI's render slots. Those pop confirmation dialogs and are null in `--mcp`. Each frame is a still of a copy.
 
-The Windows named-pipe client in the Python adapter is still not implemented. The app listens on Windows; the adapter cannot connect yet.
+### Polish before a macOS build
+
+- A stop that is already true when `cRenderJob::Execute` starts is kept for MCP jobs (`PreserveStopRequest`). Window renders still clear the flag, so the next GUI render after a stop is not stuck. `stop_before_execute` is a socket parameter used by the test, not an MCP tool. A preview with that flag ends `stopped`.
+- `render_preview`, `render_still`, and `render_animation` emit MCP progress notifications when the client supplies a progress token. Without a token, still and animation return a job id immediately and `render_status` is the fallback. Preview always waits and returns the PNG. Progress for a preview is polled on a second connection, because the first socket is inside the render call.
+- `render_animation` accepts `contact_sheet`. It writes `contact_sheet.png` when the job ends. `get_contact_sheet` builds the same strip on demand from finished frames. Thumbnails are plain images, with a short white mark instead of text, so a headless process does not need a font.
+- The Python adapter opens the Windows named pipe with `ctypes` (`CreateFileW`, `ReadFile`, `WriteFile`, `PeekNamedPipe`). `windows_pipe_path` maps Qt's listen name `mandelbulber2-<user>` to `\\.\pipe\mandelbulber2-<user>`. That mapping is unit-tested on Linux. A live Windows pipe was not connected from this VM.
+- MCP `undo` stops at the scene from when this process finished starting (after autosave recovery). Older undo files stay on disk for the window's Undo menu. They are not deleted.
+- `frame_scene` measures the fractal on the CPU (the same walk as Reset view, without a navigation widget or OpenCL) and pulls the camera back. `get_guidance` still says to set `mandelbox_scale` to -1.5. Scale 2 from the default camera is inside the solid; `frame_scene` then a draft preview produced a non-black box.
+- On macOS `sockaddr_un.sun_path` is 104 bytes including the NUL. If `~/mandelbulber/mandelbulber2-<uid>.sock` is 100 UTF-8 bytes or longer, the server listens on the temp directory, or on `/tmp/mandelbulber2-<uid>.sock` if that is also long. The session file stores the path that was opened. The adapter does not guess. Data directory on macOS is `~/mandelbulber`, not `~/.mandelbulber`. The adapter looks for `Mandelbulber2.app` and `mandelbulber2.app` under `/Applications` and `~/Applications`. qmake's `TARGET` is `mandelbulber2`, so a local build is `mandelbulber2.app`.
+
+Fractal nodes still use the nine existing slots. The container is not grown.
 
 ## macOS build plan
 
@@ -234,7 +244,7 @@ The Python MCP server stays **outside** the `.app`. `macdeployqt` will not produ
 
 - install the MCP package with `uv` or `pip`
 - a Cursor `mcp.json` / Claude Desktop config snippet that runs it
-- the app must be running, or the server will launch `mandelbulber2 --mcp` from `PATH` (on macOS, the binary inside `Mandelbulber2.app/Contents/MacOS/`)
+- the app must be running, or the server will launch `mandelbulber2 --mcp` from `PATH` (on macOS, `mandelbulber2.app` or `Mandelbulber2.app` under `Contents/MacOS/`). The exact build and client steps are in `mcp/README.md`.
 
 Data directory on macOS is `~/mandelbulber`, not `~/.mandelbulber`. The session file goes there so the adapter and the bundle agree.
 

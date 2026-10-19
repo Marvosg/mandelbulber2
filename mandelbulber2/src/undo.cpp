@@ -56,6 +56,7 @@ cUndo::cUndo(QObject *parent) : QObject(parent)
 {
 	level = 0;
 	fileIndex = 0;
+	sessionFloor = 0;
 
 	QDir undoDir(systemDirectories.GetUndoFolder());
 	QStringList listOfFiles = undoDir.entryList(QStringList() << "*.fract", QDir::Files, QDir::Time);
@@ -263,6 +264,8 @@ void cUndo::slotDelayedStore()
 	if (undoBuffer.size() > 100)
 	{
 		undoBuffer.removeFirst();
+		// Indices shifted down by one. Keep the MCP floor on the same snapshot.
+		if (sessionFloor > 0) sessionFloor--;
 	}
 	else
 	{
