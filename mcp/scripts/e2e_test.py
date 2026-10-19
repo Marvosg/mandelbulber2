@@ -89,7 +89,12 @@ async def run(artifact_dir: Path, binary: str) -> None:
             state = as_json(await session.call_tool("get_state", {"mode": "summary"}))
             print("state", state.get("summary", state).get("formulas"))
 
-            described = as_json(await session.call_tool("describe_formula", {"name": "mandelbulb"}))
+            described = as_json(
+                await session.call_tool("describe_formula", {"name": "mandelbulb", "verbose": True})
+            )
+            brief = as_json(await session.call_tool("describe_formula", {"name": "mandelbulb"}))
+            if not brief.get("start_here"):
+                raise SystemExit(f"describe_formula start_here missing: {list(brief)[:12]}")
             summary = described.get("summary", "")
             if "Mandelbulb" not in summary and "mandelbulb" not in summary.lower():
                 raise SystemExit(f"describe_formula summary was: {summary[:200]!r}")

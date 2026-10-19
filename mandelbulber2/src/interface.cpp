@@ -733,17 +733,18 @@ void cInterface::StartRender(bool noUndo)
 	progressBarAnimation->hide();
 	SynchronizeInterface(gPar, gParFractal, qInterface::read);
 
-	// Scene this viewport render was started from. Turning auto-refresh on compares
-	// against it and leaves an in-progress render of the same scene running.
-	cSettings tempSettings(cSettings::formatCondensedText);
-	tempSettings.CreateText(gPar, gParFractal);
-	autoRefreshLastHash = tempSettings.GetHashCode();
-
 	cScripts::EvaluateAll(gPar, gParFractal);
 
 	UpdateCameraRotation(gPar);
 
 	SynchronizeInterface(gPar, gParFractal, qInterface::write);
+
+	// Hash the scene the render will actually use. Capturing it before the script
+	// and camera update made the next auto-refresh look like an edit, so it stored
+	// a second identical undo a moment after the MCP session floor.
+	cSettings tempSettings(cSettings::formatCondensedText);
+	tempSettings.CreateText(gPar, gParFractal);
+	autoRefreshLastHash = tempSettings.GetHashCode();
 
 	if (!noUndo) gUndo->Store(gPar, gParFractal);
 

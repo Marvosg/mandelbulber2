@@ -67,6 +67,13 @@ the default until a surface looks melted or punched through.
    be a child of a hybrid. add_object itself accepts formula_iterations up to
    250; set_parameters can go higher, inside the program range.
 
+   Formulas in get_state, list_presets, and render summaries are the ones the
+   objects tree draws. Leftover slots are stored_but_not_drawn. clear_formula
+   empties a slot no node draws. new_scene installs one Mandelbulb, the default
+   camera, and an empty flight path, in one undo step, without writing a file
+   or changing the window's Save target. load_preset also leaves that Save
+   target alone unless set_save_target is true.
+
 4. Boolean. add_object type boolean_add (union), boolean_mul (overlap only), or
    boolean_sub (carve later children out of the first). Children can be fractal
    nodes or primitives. add_object type primitive, primitive sphere, parent_id
@@ -182,7 +189,8 @@ the PNG is not black. set_material defines it on the live session.
 
 The color you actually see is often iteration fog, not the material. Turn it on
 with set_parameters iteration_fog_enable true, and set iteration_fog_color_1
-to an [r, g, b] or #rrggbb. glow_enabled is the cheap halo and starts on.
+to an [r, g, b] or #rrggbb. iteration_fog_color_1_maxiter is a number, not a
+color. glow_enabled is the cheap halo and starts on.
 brightness and gamma fix a picture that is the right shape but dark.
 
 set_light id 1 is the key light. A fresh session has no lights defined; orbit
@@ -201,6 +209,8 @@ produce 5 interpolated frames, because the last key contributes one frame.
 Camera, target, and fov use Akima interpolation, which overshoots a large jump
 in position or angle, so the in-between frames miss the shape. Keep each new
 key a small step from the last, and keep the target on the surface.
+update_keyframe with only frames_per_keyframe does not replace the stored
+camera. set_flight_path kind orbit takes sweep in degrees, default 360.
 render_animation mode keyframe, quality draft,
 long_side 160, and a short start/end. Without a progress token, or with wait
 false, it returns a job id immediately. With a progress token and wait true
@@ -222,7 +232,7 @@ animations wait in the main queue and run one at a time. Previews and draft or
 better jobs wait in the agent queue, which runs at the same time as the main
 queue, so a long still does not block look-checks. The Background renders dock
 lists both. Render in background there queues the current scene as a full still
-in the main queue and leaves the viewport free. View on a row opens a live
+in the main queue and leaves the viewport free. The preview on a row opens a live
 window of that render. If the user presses Stop there, render_status is status cancelled
 with cancelled_by_user true and error "The user cancelled this render." That
 stop was intentional. Do not start a replacement unless asked. An agent

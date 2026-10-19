@@ -23,6 +23,7 @@
 #include <QLocale>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
 #include <QStringList>
 #include <QTextStream>
 #include <QVector>
@@ -47,6 +48,7 @@
 #include "interface.hpp"
 #include "keyframes.hpp"
 #include "object_node_type.h"
+#include "objects_tree.h"
 #include "render_job.hpp"
 #include "render_window.hpp"
 #include "rendering_configuration.hpp"
@@ -126,6 +128,7 @@ void RememberEdit()
 	if (!gUndo) return;
 	gUndo->Store(gPar, gParFractal, gAnimFrames, gKeyframes);
 	gUndo->CommitNow();
+	mcpScene::CommitUndoAction();
 }
 
 QJsonObject Fail(const QString &message)
@@ -505,21 +508,106 @@ bool LoadPresetContainers(const QString &path, std::shared_ptr<cParameterContain
 	return true;
 }
 
-QJsonArray PresetFormulas(const cFractalContainer &fractal)
+QString NodeTypeName(enumNodeType type)
 {
-	QJsonArray formulas;
-	for (int i = 0; i < fractal.size(); i++)
+	switch (type)
 	{
-		const int formulaId = fractal.at(i)->Get<int>("formula");
+		case enumNodeType::fractal: return QString("fractal");
+		case enumNodeType::primitive: return QString("primitive");
+		case enumNodeType::hybrid: return QString("hybrid");
+		case enumNodeType::booleanAdd: return QString("boolean_add");
+		case enumNodeType::booleanMul: return QString("boolean_mul");
+		case enumNodeType::booleanSub: return QString("boolean_sub");
+		default: return QString("unknown");
+	}
+}
+
+QJsonObject EffectsObject(cParameterContainer *par)
+{
+	QJsonObject effects;
+	if (!par) return effects;
+	const QStringList flags = {"ambient_occlusion_enabled", "DOF_enabled", "basic_fog_enabled",
+		"volumetric_fog_enabled", "iteration_fog_enable", "glow_enabled", "raytraced_reflections",
+		"DOF_MC_global_illumination", "antialiasing_enabled"};
+	for (const QString &flag : flags)
+	{
+		if (par->IfExists(flag)) effects[flag] = par->Get<bool>(flag);
+	}
+	if (par->IfExists("DOF_focus")) effects["DOF_focus"] = par->Get<double>("DOF_focus");
+	if (par->IfExists("DOF_radius")) effects["DOF_radius"] = par->Get<double>("DOF_radius");
+	if (par->IfExists("basic_fog_visibility"))
+		effects["basic_fog_visibility"] = par->Get<double>("basic_fog_visibility");
+	if (par->IfExists("antialiasing_size"))
+		effects["antialiasing_size"] = par->Get<int>("antialiasing_size");
+	return effects;
+}
+
+void FillFormulaReport(QJsonObject *target, const std::shared_ptr<cParameterContainer> &par,
+	const std::shared_ptr<cFractalContainer> &fractal)
+{
+	QSet<int> drawn;
+	bool haveTree = false;
+	if (par)
+	{
+		const QList<int> drawnSlots = mcpScene::DrawnFormulaSlots(par);
+		haveTree = !drawnSlots.isEmpty();
+		for (int slot : drawnSlots)
+			drawn.insert(slot);
+	}
+	QJsonArray formulas;
+	QJsonArray idle;
+	for (int i = 0; i < fractal->size(); i++)
+	{
+		const int formulaId = fractal->at(i)->Get<int>("formula");
 		if (formulaId == int(fractal::none)) continue;
 		QJsonObject slot;
 		slot["slot"] = i + 1;
 		slot["formula"] = FormulaNameFor(formulaId);
-		if (fractal.at(i)->IfExists("formula_iterations"))
-			slot["formula_iterations"] = fractal.at(i)->Get<int>("formula_iterations");
-		formulas.append(slot);
+		if (fractal->at(i)->IfExists("formula_iterations"))
+			slot["formula_iterations"] = fractal->at(i)->Get<int>("formula_iterations");
+		if (fractal->at(i)->IfExists("power")) slot["power"] = fractal->at(i)->Get<double>("power");
+		if (fractal->at(i)->IfExists("mandelbox_scale"))
+			slot["mandelbox_scale"] = fractal->at(i)->Get<double>("mandelbox_scale");
+		if (fractal->at(i)->IfExists("IFS_scale"))
+			slot["IFS_scale"] = fractal->at(i)->Get<double>("IFS_scale");
+		if (!haveTree || drawn.contains(i + 1))
+			formulas.append(slot);
+		else
+			idle.append(slot);
 	}
-	return formulas;
+	(*target)["formulas"] = formulas;
+	if (!idle.isEmpty()) (*target)["stored_but_not_drawn"] = idle;
+}
+
+QJsonArray PresetTree(const std::shared_ptr<cParameterContainer> &par,
+	const std::shared_ptr<cFractalContainer> &fractal)
+{
+	QJsonArray nodes;
+	if (!par) return nodes;
+	cObjectsTree tree;
+	for (const cObjectsTree::sNodeListItem &node : tree.GetListOfNodes(par))
+	{
+		QJsonObject item;
+		item["id"] = node.id;
+		item["name"] = node.name;
+		item["type"] = NodeTypeName(node.type);
+		item["parent_id"] = node.parentId;
+		item["object_id"] = node.objectId;
+		if (node.type == enumNodeType::fractal && fractal && node.objectId >= 1
+			&& node.objectId <= fractal->size())
+		{
+			const int formulaId = fractal->at(node.objectId - 1)->Get<int>("formula");
+			item["formula"] = FormulaNameFor(formulaId);
+			if (fractal->at(node.objectId - 1)->IfExists("power"))
+				item["power"] = fractal->at(node.objectId - 1)->Get<double>("power");
+			if (fractal->at(node.objectId - 1)->IfExists("mandelbox_scale"))
+				item["mandelbox_scale"] = fractal->at(node.objectId - 1)->Get<double>("mandelbox_scale");
+			if (fractal->at(node.objectId - 1)->IfExists("IFS_scale"))
+				item["IFS_scale"] = fractal->at(node.objectId - 1)->Get<double>("IFS_scale");
+		}
+		nodes.append(item);
+	}
+	return nodes;
 }
 
 QJsonObject PresetRecord(const QString &path, bool withDetail)
@@ -536,8 +624,10 @@ QJsonObject PresetRecord(const QString &path, bool withDetail)
 		record["error"] = error;
 		return record;
 	}
-	record["formulas"] = PresetFormulas(*fractal);
+	FillFormulaReport(&record, par, fractal);
 	if (!withDetail) return record;
+	record["tree"] = PresetTree(par, fractal);
+	record["effects"] = EffectsObject(par.get());
 	record["detail_level"] = par->Get<double>("detail_level");
 	record["image_width"] = par->Get<int>("image_width");
 	record["image_height"] = par->Get<int>("image_height");
@@ -632,8 +722,10 @@ QJsonObject InspectPreset(const QJsonObject &params)
 		result["thumbnail_pending"] = true;
 	if (result.contains("thumbnail_path"))
 	{
+		result["thumbnail"] = result.value("thumbnail_path");
 		result["note"] =
-			"formulas are the slots stored in the preset. The image is the toolbar thumbnail.";
+			"formulas are the ones the objects tree draws. stored_but_not_drawn lists leftover slots. "
+			"thumbnail and thumbnail_path are the toolbar image file.";
 	}
 	else if (systemData.noGui)
 		result["note"] = "This session has no preset strip, so there is no thumbnail.";
@@ -693,7 +785,7 @@ QJsonObject DeletePreset(const QJsonObject &params)
 	return result;
 }
 
-bool LoadFractFile(const QString &path, QString *error)
+bool LoadFractFile(const QString &path, QString *error, bool setSaveTarget = true)
 {
 	cSettings settings(cSettings::formatFullText);
 	if (!settings.LoadFromFile(path) || !settings.Decode(gPar, gParFractal, gAnimFrames, gKeyframes))
@@ -701,7 +793,7 @@ bool LoadFractFile(const QString &path, QString *error)
 		*error = QString("Could not read settings from %1.").arg(path);
 		return false;
 	}
-	systemData.lastSettingsFile = path;
+	if (setSaveTarget) systemData.lastSettingsFile = path;
 	RememberEdit();
 	return true;
 }
@@ -709,20 +801,7 @@ bool LoadFractFile(const QString &path, QString *error)
 QJsonObject StateSummary()
 {
 	QJsonObject summary;
-	QJsonArray formulas;
-	for (int i = 0; i < gParFractal->size(); i++)
-	{
-		const int formulaId = gParFractal->at(i)->Get<int>("formula");
-		if (formulaId == int(fractal::none)) continue;
-		QJsonObject slot;
-		slot["slot"] = i + 1;
-		slot["formula"] = FormulaNameFor(formulaId);
-		slot["formula_iterations"] = gParFractal->at(i)->Get<int>("formula_iterations");
-		if (gParFractal->at(i)->IfExists("power"))
-			slot["power"] = gParFractal->at(i)->Get<double>("power");
-		formulas.append(slot);
-	}
-	summary["formulas"] = formulas;
+	FillFormulaReport(&summary, gPar, gParFractal);
 	summary["camera"] = mcpCatalog::ParameterRecord(gPar.get(), "camera").value("value");
 	summary["target"] = mcpCatalog::ParameterRecord(gPar.get(), "target").value("value");
 	summary["fov"] = gPar->Get<double>("fov");
@@ -1053,6 +1132,11 @@ QByteArray cMcpServer::HandleLine(const QByteArray &line)
 
 QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &params)
 {
+	struct sDropPendingUndo
+	{
+		~sDropPendingUndo() { mcpScene::ClearPendingUndoAction(); }
+	} dropPending;
+	mcpScene::NoteUndoAction(method);
 	if (mcpScene::JobActive())
 	{
 		const QStringList allowed = {"get_session", "get_state", "program_facts", "list_formulas",
@@ -1119,7 +1203,8 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 	if (method == "describe_formula")
 	{
 		QString error;
-		QJsonObject described = mcpCatalog::DescribeFormula(params.value("name").toString(), &error);
+		QJsonObject described = mcpCatalog::DescribeFormula(params.value("name").toString(), &error,
+			params.value("verbose").toBool(false));
 		if (!error.isEmpty()) return Fail(error);
 		return described;
 	}
@@ -1153,8 +1238,9 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 	if (method == "list_examples")
 	{
 		QJsonObject result;
-		result["examples"] =
-			mcpCatalog::ListExamples(params.value("query").toString(), params.value("limit").toInt(20));
+		result["examples"] = mcpCatalog::ListExamples(params.value("query").toString(),
+			params.value("limit").toInt(20), params.value("collection").toString());
+		result["collections"] = mcpCatalog::ExampleCollections();
 		result["hint"] =
 			"load_example copies an example into the live session and can be undone. It does not edit "
 			"the example file.";
@@ -1258,6 +1344,42 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		return result;
 	}
 
+	if (method == "clear_formula")
+	{
+		const int slot = params.value("slot").toInt(params.value("fractal_slot").toInt(1));
+		if (slot < 1 || slot > gParFractal->size()) return Fail("slot must be 1 to 9.");
+		const bool force = params.value("force").toBool(false);
+		QStringList users;
+		const QList<QString> names = gPar->GetListOfParameters();
+		for (const QString &name : names)
+		{
+			if (!name.startsWith("node_") || !name.endsWith("_definition")) continue;
+			const QStringList parts = gPar->Get<QString>(name).split(',');
+			if (parts.size() < 5) continue;
+			if (parts.at(2).toInt() != int(enumNodeType::fractal)) continue;
+			if (parts.at(4).toInt() != slot) continue;
+			users << QString("%1 (id %2)").arg(parts.at(0)).arg(name.mid(5, 4).toInt());
+		}
+		if (!users.isEmpty() && !force)
+		{
+			return Fail(QString("Slot %1 is still drawn by %2. delete_object that node first, or pass "
+													"force true to empty the slot anyway.")
+										.arg(slot)
+										.arg(users.join(", ")));
+		}
+		gParFractal->at(slot - 1)->Set("formula", int(fractal::none));
+		RememberEdit();
+		QJsonObject result;
+		result["slot"] = slot;
+		result["formula"] = QString("none");
+		if (!users.isEmpty()) result["still_referenced_by"] = users.join(", ");
+		result["summary"] = StateSummary();
+		result["note"] = users.isEmpty()
+			? "The slot is empty. Summaries list formulas the objects tree draws."
+			: "The slot is empty, but a tree node still points at it. delete_object that node.";
+		return result;
+	}
+
 	if (method == "load_settings" || method == "load_example")
 	{
 		QString path = params.value("path").toString();
@@ -1318,12 +1440,20 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		QString error;
 		const QList<QString> matches = MatchPresets(params.value("name").toString(), &error);
 		if (!error.isEmpty()) return Fail(error);
-		if (!LoadFractFile(matches.first(), &error)) return Fail(error);
+		const bool setSaveTarget = params.value("set_save_target").toBool(false);
+		const QString previous = systemData.lastSettingsFile;
+		if (!LoadFractFile(matches.first(), &error, setSaveTarget)) return Fail(error);
 		QJsonObject result;
 		result["loaded"] = matches.first();
 		result["agent"] = RenderWindow::PresetFileIsAgent(matches.first());
+		result["save_target"] = systemData.lastSettingsFile;
+		result["save_target_changed"] = setSaveTarget;
+		result["previous_save_target"] = previous;
 		result["summary"] = StateSummary();
 		result["undo"] = "One undo returns to the session from before this load.";
+		result["note"] = setSaveTarget
+			? QString("The window's Save target is now this preset.")
+			: QString("Loaded into the session. The window's Save target was left unchanged.");
 		return result;
 	}
 
@@ -1333,16 +1463,43 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		bool frames = false;
 		bool keyframes = false;
 		const bool isUndo = method == "undo";
+		auto cameraJson = []() {
+			const CVector3 camera = gPar->Get<CVector3>("camera");
+			return QJsonArray{camera.x, camera.y, camera.z};
+		};
 		if (isUndo && !gUndo->CanUndo())
-			return Fail("Nothing to undo in this session. Undo stops at the scene from when this "
-									"process finished starting, including after autosave recovery. The window's "
-									"Undo menu can still reach older files.");
-		if (!isUndo && !gUndo->CanRedo()) return Fail("Nothing to redo.");
+		{
+			QJsonObject result;
+			result["undone"] = QString("nothing_to_undo");
+			result["nothing_to_undo"] = true;
+			result["error"] =
+				"Nothing to undo in this session. Undo stops at the scene from when this "
+				"process finished starting, including after autosave recovery. The window's "
+				"Undo menu can still reach older files.";
+			result["camera"] = cameraJson();
+			return result;
+		}
+		if (!isUndo && !gUndo->CanRedo())
+		{
+			QJsonObject result;
+			result["redone"] = QString("nothing_to_redo");
+			result["nothing_to_redo"] = true;
+			result["error"] = "Nothing to redo.";
+			result["camera"] = cameraJson();
+			return result;
+		}
+		const QJsonArray cameraBefore = cameraJson();
 		const bool ok = isUndo ? gUndo->Undo(gPar, gParFractal, gAnimFrames, gKeyframes, &frames, &keyframes)
 													 : gUndo->Redo(gPar, gParFractal, gAnimFrames, gKeyframes, &frames, &keyframes);
 		if (!ok) return Fail(isUndo ? QString("Undo failed.") : QString("Redo failed."));
 		PushWidgets();
 		QJsonObject result;
+		if (isUndo)
+			result["undone"] = mcpScene::TakeUndoneAction();
+		else
+			result["redone"] = mcpScene::TakeRedoneAction();
+		result["camera_before"] = cameraBefore;
+		result["camera_after"] = cameraJson();
 		result["summary"] = StateSummary();
 		return result;
 	}

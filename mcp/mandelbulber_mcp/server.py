@@ -175,7 +175,7 @@ async def _await_job(ctx: Context, started: dict, wait: bool = True) -> dict:
     return pending
 
 
-async def _wait_for_completion(ctx: Context | None, job_id: str) -> dict:
+async def _wait_for_completion(ctx: Context | None, job_id: str, grid: str = "best") -> dict:
     """Hold the tool call open until the job finishes.
 
     The returned status is the completion notice. Progress notifications during
@@ -184,8 +184,13 @@ async def _wait_for_completion(ctx: Context | None, job_id: str) -> dict:
 
     last = -1.0
     while True:
+        status_params: dict = {}
+        if job_id:
+            status_params["id"] = job_id
+        if grid == "full":
+            status_params["grid"] = "full"
         status = await asyncio.to_thread(
-            bridge.call, "render_status", {"id": job_id} if job_id else None, 30
+            bridge.call, "render_status", status_params or None, 30
         )
         progress = float(status.get("progress") or 0)
         message = str(status.get("message") or status.get("status") or "")
@@ -301,18 +306,21 @@ def list_formulas(query: str = "", limit: int = 20) -> str:
 
 
 @server.tool()
-def describe_formula(name: str) -> str:
+def describe_formula(name: str, verbose: bool = False) -> str:
     """Explain one formula in plain language.
 
-    Includes the info-panel description, reference links, example filenames,
-    how its distance estimation behaves, where the shape usually lives
-    (where, and typical_radius when that radius is known), the controls that
-    formula's window actually shows (label, tooltip, default, range), and the
-    common slot controls such as power, formula_iterations, and julia_mode.
-    name is the internal name or the display name.
+    where and typical_radius say where the shape lives. start_here is three to
+    six controls with one sentence and a known-good value. Pass verbose true
+    for every control that formula's window shows. name is the internal name
+    or the display name. power is an exponent, not the Mandelbox size. An IFS
+    size is IFS_scale.
     """
 
-    return _call("describe_formula", {"name": name})
+    if not isinstance(name, str) or not name.strip():
+        return "Error: name must be an internal name or a display name."
+    if not isinstance(verbose, bool):
+        return "Error: verbose must be true or false."
+    return _call("describe_formula", {"name": name, "verbose": verbose})
 
 
 @server.tool()
@@ -360,16 +368,24 @@ def describe_parameter(name: str, fractal_slot: int = 1) -> str:
 
 
 @server.tool()
-def list_examples(query: str = "", limit: int = 20) -> str:
+def list_examples(query: str = "", limit: int = 20, collection: str = "") -> str:
     """Find shipped example .fract files by a word in the filename.
 
-    load_example copies one into the live session. It does not edit the example.
+    An empty query returns a short sample from each collection, plus a
+    collections list with a count. collection limits the list to one of those
+    names. load_example copies one into the live session. It does not edit the
+    example.
     """
 
     error = _int_error(limit, "limit", 1, 10000)
     if error:
         return f"Error: {error}"
-    return _call("list_examples", {"query": query, "limit": limit})
+    if collection and not isinstance(collection, str):
+        return "Error: collection must be a name from collections."
+    params: dict = {"query": query, "limit": limit}
+    if collection:
+        params["collection"] = collection
+    return _call("list_examples", params)
 
 
 @server.tool()
@@ -377,9 +393,11 @@ def set_parameters(parameters: dict, fractal_slot: int = 1) -> str:
     """Change live parameters. One undo step for the whole batch.
 
     parameters is a JSON object of name to value. Numbers must be JSON numbers.
-    Vectors are arrays of numbers. A parameter whose name contains "color" or
-    "colour" must be #rrggbb or [r, g, b]; anything else is rejected before it
-    is sent. fractal_slot
+    Vectors are arrays of numbers. A color is #rrggbb or [r, g, b] only when
+    the parameter's type is a color. A name that merely contains "color", such
+    as iteration_fog_color_1_maxiter, is a number and is sent as one. If one
+    field is invalid, the rest are still applied and the result lists per-field
+    errors. fractal_slot
     1 to 9 receives formula controls such as power when the name exists on that
     slot; otherwise the main parameters are used. Names like fractal2_power
     address a slot directly. Nothing is written to the user's file.
@@ -408,10 +426,6 @@ def set_parameters(parameters: dict, fractal_slot: int = 1) -> str:
             if gradient:
                 return f"Error: {name}: {gradient}"
             continue
-        if "color" in lowered or "colour" in lowered:
-            color = _color_error(value, name)
-            if color:
-                return f"Error: {color}"
         if lowered == "threads_priority" or lowered.endswith("_threads_priority"):
             priority = _int_error(value, name, 0, 3)
             if priority:
@@ -443,13 +457,16 @@ def set_formula(formula: str, slot: int = 1) -> str:
 
 
 @server.tool(structured_output=False)
-async def render_preview(quality: str = "draft", long_side: int = 320, ctx: Context = None) -> list:
+async def render_preview(
+    quality: str = "draft", long_side: int = 320, grid: str = "best", ctx: Context = None
+) -> list:
     """Render a small PNG and return the image.
 
-    The note includes a ranked grid of square cells. column and row are
-    0-based. ranked is every cell, best first. label is sky, inside, edge,
-    ridge, pocket, slope, or flat. Nothing is drawn on the image. probe_view
-    with no arguments returns the same grid.
+    The note includes best and the top five ranked cells. column and row are
+    0-based. label is sky, inside, edge, ridge, pocket, slope, or flat. Pass
+    grid full for every cell. Nothing is drawn on the image. probe_view with
+    no arguments returns the same short grid. The note names the quality you
+    asked for. message on a finished job is the whole-job time.
 
     Uses a throwaway copy: the user's resolution, detail_level, and expensive
     effects are not modified. The render runs off the UI thread, so an open
@@ -468,13 +485,15 @@ async def render_preview(quality: str = "draft", long_side: int = 320, ctx: Cont
 
     error = _choice_error(quality, "quality", ("draft", "better", "full")) or _int_error(
         long_side, "long_side", 16, 4096
-    )
+    ) or _choice_error(grid, "grid", ("best", "full"))
     if error:
         return [f"Error: {error}"]
     if quality == "draft" and long_side == 320:
         params: dict = {"quality": quality}
     else:
         params = {"quality": quality, "long_side": long_side}
+    if grid == "full":
+        params["grid"] = "full"
     try:
         if ctx is not None and _has_progress_token(ctx):
             result = await _preview_with_progress(ctx, params)
@@ -614,6 +633,7 @@ def update_object(
     position: list | None = None,
     rotation: list | None = None,
     scale: float = 0,
+    radius: float | None = None,
     material: int = 0,
     enabled: bool | None = None,
     parent_id: int | None = None,
@@ -621,7 +641,9 @@ def update_object(
 ) -> str:
     """Move, rename, reparent, or reassign a node from get_objects_tree. One undo step.
 
-    position and rotation are [x, y, z]. parent_id 0 is the world.
+    position and rotation are [x, y, z]. parent_id 0 is the world. radius sets a
+    primitive's radius (or its size, for a box). The tree echoes primitive, radius,
+    and size.
     """
 
     error = _int_error(id, "id", 1, 100000)
@@ -637,6 +659,10 @@ def update_object(
             return f"Error: {error}"
     if scale:
         error = _number_error(scale, "scale")
+        if error:
+            return f"Error: {error}"
+    if radius is not None:
+        error = _number_error(radius, "radius", 0)
         if error:
             return f"Error: {error}"
     if material:
@@ -656,6 +682,8 @@ def update_object(
         params["rotation"] = rotation
     if scale:
         params["scale"] = scale
+    if radius is not None:
+        params["radius"] = radius
     if material:
         params["material"] = material
     if enabled is not None:
@@ -1478,8 +1506,11 @@ async def render_still(
 
 
 @server.tool()
-async def render_status(id: str = "", wait: bool = False, ctx: Context = None) -> str:
+async def render_status(id: str = "", wait: bool = False, grid: str = "best", ctx: Context = None) -> str:
     """Progress of a still or animation job: status, frame, progress, image path, error.
+
+    message matches status. A finished job reports the whole-job wall time.
+    grid full includes every preview cell; the default is best and the top five.
 
     Omit id to ask about the job that is running, or the last one started.
     done is true when status is finished, stopped, failed, or cancelled.
@@ -1493,13 +1524,21 @@ async def render_status(id: str = "", wait: bool = False, ctx: Context = None) -
     call that has already returned.
     """
 
+    error = _choice_error(grid, "grid", ("best", "full"))
+    if error:
+        return f"Error: {error}"
+    params: dict = {}
+    if id:
+        params["id"] = id
+    if grid == "full":
+        params["grid"] = "full"
     if wait:
         try:
-            status = await _wait_for_completion(ctx, id)
+            status = await _wait_for_completion(ctx, id, grid)
             return _dump(status)
         except (RuntimeError, ConnectionError, OSError) as exc:
             return f"Error: {exc}"
-    return _call("render_status", {"id": id} if id else None)
+    return _call("render_status", params or None)
 
 
 @server.tool()
@@ -1568,10 +1607,22 @@ def add_keyframe(frames_per_keyframe: int = 4, index: int = -1) -> str:
 
 
 @server.tool()
-def update_keyframe(index: int, frames_per_keyframe: int = 0) -> str:
-    """Replace key `index` with the camera as it is right now. One undo step.
+def update_keyframe(
+    index: int,
+    frames_per_keyframe: int = 0,
+    camera: list | None = None,
+    target: list | None = None,
+    rotation: list | None = None,
+    fov: float | None = None,
+    distance: float | None = None,
+) -> str:
+    """Change one key. One undo step.
 
-    Pass frames_per_keyframe to change how many pictures lead to the next key.
+    Pass only frames_per_keyframe to change how many pictures lead to the next
+    key. That does not replace the stored camera, target, or fov. Pass camera,
+    target, rotation, fov, or distance to change those stored values. With only
+    index, the key is replaced by the camera as it is right now. A second
+    animation edit is rejected while one is in progress or an animation is rendering.
     """
 
     error = _int_error(index, "index", 0, 100000) or _int_error(
@@ -1579,9 +1630,32 @@ def update_keyframe(index: int, frames_per_keyframe: int = 0) -> str:
     )
     if error:
         return f"Error: {error}"
+    for label, value in (("camera", camera), ("target", target), ("rotation", rotation)):
+        if value is not None:
+            error = _vec3_error(value, label)
+            if error:
+                return f"Error: {error}"
+    if fov is not None:
+        error = _number_error(fov, "fov", 0, 720)
+        if error:
+            return f"Error: {error}"
+    if distance is not None:
+        error = _number_error(distance, "distance", 0)
+        if error:
+            return f"Error: {error}"
     params: dict = {"index": index}
     if frames_per_keyframe:
         params["frames_per_keyframe"] = frames_per_keyframe
+    if camera is not None:
+        params["camera"] = camera
+    if target is not None:
+        params["target"] = target
+    if rotation is not None:
+        params["rotation"] = rotation
+    if fov is not None:
+        params["fov"] = fov
+    if distance is not None:
+        params["distance"] = distance
     return _call("update_keyframe", params)
 
 
@@ -1606,15 +1680,17 @@ def set_flight_path(
     end: list | None = None,
     fov: float | None = None,
     frames: list | None = None,
+    sweep: float = 360,
 ) -> str:
     """Replace the flight path. Does not change keyframes. One undo step.
 
-    kind orbit circles the target. radius defaults to the current camera
-    distance, height defaults to the camera's z. kind flythrough moves the eye
-    in a straight line from start to end; keep target on the shape. kind frames
-    takes a list of {camera, target, fov} objects, at least two. count is the
-    number of pictures for orbit and flythrough (2 to 360). Render with
-    render_animation mode flight.
+    kind orbit looks at the target along an arc. sweep is degrees of that arc,
+    default 360, a full circle. A shorter sweep does not repeat the first frame.
+    radius defaults to the current camera distance, height defaults to the
+    camera's z. kind flythrough moves the eye in a straight line from start to
+    end; keep target on the shape. kind frames takes a list of {camera, target,
+    fov} objects, at least two. count is the number of pictures for orbit and
+    flythrough (2 to 360). Render with render_animation mode flight.
     """
 
     error = _choice_error(kind, "kind", ("orbit", "flythrough", "frames")) or _int_error(
@@ -1631,6 +1707,9 @@ def set_flight_path(
         error = _number_error(fov, "fov", 0, 720)
         if error:
             return f"Error: {error}"
+    error = _number_error(sweep, "sweep", 0.001, 360)
+    if error:
+        return f"Error: {error}"
     for label, value in (("target", target), ("start", start), ("end", end)):
         if value is not None:
             error = _vec3_error(value, label)
@@ -1654,7 +1733,7 @@ def set_flight_path(
                 error = _number_error(frame["fov"], "fov", 0, 720)
                 if error:
                     return f"Error: {error}"
-    params: dict = {"kind": kind, "count": count}
+    params: dict = {"kind": kind, "count": count, "sweep": sweep}
     if radius is not None:
         params["radius"] = radius
     if height is not None:
@@ -1803,8 +1882,8 @@ def inspect_preset(name: str) -> list:
         result = bridge.call("inspect_preset", {"name": name}, timeout=90)
     except (RuntimeError, ConnectionError, OSError) as exc:
         return [f"Error: {exc}"]
-    path = result.get("thumbnail_path")
-    note = _dump({key: value for key, value in result.items() if key != "thumbnail_path"})
+    path = result.get("thumbnail_path") or result.get("thumbnail")
+    note = _dump(result)
     if not path:
         return [note]
     data = open(path, "rb").read()
@@ -1828,16 +1907,20 @@ def save_preset(name: str, overwrite: bool = False) -> str:
 
 
 @server.tool()
-def load_preset(name: str) -> str:
+def load_preset(name: str, set_save_target: bool = False) -> str:
     """Load a user or agent preset into the live session. One undo step.
 
-    Does not modify the preset file. If the name matches more than one card,
-    the error lists them.
+    Does not modify the preset file, and does not change the window's Save
+    target. Pass set_save_target true only when that preset should become the
+    file the window saves. If the name matches more than one card, the error
+    lists them.
     """
 
     if not isinstance(name, str) or not name.strip():
         return "Error: name is the preset title from list_presets."
-    return _call("load_preset", {"name": name})
+    if not isinstance(set_save_target, bool):
+        return "Error: set_save_target must be true or false."
+    return _call("load_preset", {"name": name, "set_save_target": set_save_target})
 
 
 @server.tool()
@@ -1896,14 +1979,43 @@ def save_settings(path: str, overwrite: bool = False) -> str:
 def undo() -> str:
     """Undo the last edit made in this Mandelbulber process.
 
-    Stops at the scene from when this process finished starting (after autosave
-    recovery, if that dialog was answered). It does not walk undo files left by
-    an older session. The window's Undo menu can still reach those. Each MCP
-    edit is one step: parameters, formula, tree, look, camera, animation, or a
-    load.
+    The result names what was undone, or nothing_to_undo, and gives the camera
+    before and after. Stops at the scene from when this process finished
+    starting (after autosave recovery, if that dialog was answered). It does
+    not walk undo files left by an older session. The window's Undo menu can
+    still reach those. Each MCP edit is one step: parameters, formula, tree,
+    look, camera, animation, or a load.
     """
 
     return _call("undo")
+
+
+@server.tool()
+def clear_formula(slot: int = 1, force: bool = False) -> str:
+    """Empty one formula slot. One undo step.
+
+    Refuses while an objects-tree node still draws that slot. Pass force true
+    to empty it anyway; delete_object is then still required. Summaries list
+    only formulas the tree draws. Leftover slots are stored_but_not_drawn.
+    """
+
+    error = _int_error(slot, "slot", 1, 9)
+    if error:
+        return f"Error: {error}"
+    if not isinstance(force, bool):
+        return "Error: force must be true or false."
+    return _call("clear_formula", {"slot": slot, "force": force})
+
+
+@server.tool()
+def new_scene() -> str:
+    """Replace the live session with one Mandelbulb and the default camera. One undo step.
+
+    The flight path and keyframes are cleared. No file is written, and the
+    window's Save target is left unchanged.
+    """
+
+    return _call("new_scene")
 
 
 @server.tool()

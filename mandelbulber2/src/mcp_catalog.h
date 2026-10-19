@@ -25,9 +25,10 @@ namespace mcpCatalog
 void EnsureLoaded();
 
 QJsonArray ListFormulas(const QString &query, int limit);
-QJsonObject DescribeFormula(const QString &name, QString *error);
+QJsonObject DescribeFormula(const QString &name, QString *error, bool verbose = false);
 
-QJsonArray ListExamples(const QString &query, int limit);
+QJsonArray ListExamples(const QString &query, int limit, const QString &collection = QString());
+QJsonArray ExampleCollections();
 QString ResolveExample(const QString &query, QString *error);
 
 QJsonObject DescribeParameter(

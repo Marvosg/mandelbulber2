@@ -7,11 +7,15 @@
 #ifndef MANDELBULBER2_SRC_MCP_SCENE_H_
 #define MANDELBULBER2_SRC_MCP_SCENE_H_
 
+#include <memory>
+
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
 #include <QString>
+
+class cParameterContainer;
 
 namespace mcpScene
 {
@@ -69,6 +73,16 @@ sJobView SampleJobView(
 bool ResumeBackground();
 // Interrupted stills and animations that the startup dialog can offer.
 QJsonArray Checkpoints();
+
+// Formula slots that an enabled objects-tree node actually draws.
+QList<int> DrawnFormulaSlots(const std::shared_ptr<cParameterContainer> &par);
+
+// The next Remember() records this as what undo will name.
+void NoteUndoAction(const QString &action);
+void CommitUndoAction();
+void ClearPendingUndoAction();
+QString TakeUndoneAction();
+QString TakeRedoneAction();
 }
 
 #endif /* MANDELBULBER2_SRC_MCP_SCENE_H_ */

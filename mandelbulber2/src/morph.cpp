@@ -82,6 +82,9 @@ cMorph &cMorph::operator=(const cMorph &source)
 		splineCubic = gsl_spline_alloc(gsl_interp_cspline, size_t(listSize));
 		splineSteffen = gsl_spline_alloc(gsl_interp_steffen, size_t(listSize));
 		dataSets = source.dataSets;
+		// The index list is what Interpolate reads. Copying only dataSets left it empty
+		// and the next keyframe render crashed on the copied animation.
+		frameIndices = source.frameIndices;
 	}
 	return *this;
 }

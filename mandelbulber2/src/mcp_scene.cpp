@@ -113,7 +113,9 @@ struct sJob
 	// Started from the Background renders dock. Uses the session's thread settings.
 	bool fromWindow = false;
 	qint64 lastThumbMs = 0;
+	qint64 startedAt = 0;
 	qint64 finishedAt = 0;
+	bool cameraInside = false;
 	std::function<void(std::shared_ptr<sJob>)> body;
 	// Socket-only. Set immediately before Execute so a stop that arrives
 	// before the render clears its flag is still honored.
@@ -415,9 +417,12 @@ void Remember()
 	{
 		gUndo->Store(gPar, gParFractal, gAnimFrames, gKeyframes);
 		gUndo->CommitNow();
+		mcpScene::CommitUndoAction();
 	}
 	RefreshGui();
 }
+
+bool SetPrimitiveSize(int nodeId, double radius, QString *what, QString *error);
 
 QJsonObject NodeJson(const cObjectsTree::sNodeListItem &node)
 {
@@ -450,6 +455,29 @@ QJsonObject NodeJson(const cObjectsTree::sNodeListItem &node)
 					gParFractal->at(node.objectId - 1)->Get<int>("formula_iterations");
 				break;
 			}
+		}
+	}
+	if (node.type == enumNodeType::primitive)
+	{
+		for (const sPrimitiveItem &primitive : cPrimitives::GetListOfPrimitives(gPar))
+		{
+			if (!gPar->IfExists(primitive.Name("object_id"))) continue;
+			if (gPar->Get<int>(primitive.Name("object_id")) != node.objectId) continue;
+			object["primitive"] = primitive.typeName;
+			if (gPar->IfExists(primitive.Name("radius")))
+				object["radius"] = gPar->Get<double>(primitive.Name("radius"));
+			if (gPar->IfExists(primitive.Name("size")))
+			{
+				const QString sizeName = primitive.Name("size");
+				if (gPar->GetVarType(sizeName) == typeVector3)
+				{
+					const CVector3 size = gPar->Get<CVector3>(sizeName);
+					object["size"] = QJsonArray{size.x, size.y, size.z};
+				}
+				else
+					object["size"] = gPar->Get<double>(sizeName);
+			}
+			break;
 		}
 	}
 	return object;
@@ -1104,6 +1132,9 @@ bool RenderOne(const std::shared_ptr<sJob> &job, const QString &basePath, QStrin
 				double overall = progress;
 				{
 					QMutexLocker locker(&job->mutex);
+					// The render posts this on the UI thread. A last "100% done" line can
+					// arrive after FinishJob and would replace the whole-job time.
+					if (job->done.load()) return;
 					if (job->frameCount > 1)
 					{
 						overall = (double(job->frame) + progress) / double(job->frameCount);
@@ -1160,8 +1191,17 @@ bool RenderOne(const std::shared_ptr<sJob> &job, const QString &basePath, QStrin
 	if (!job->anim)
 	{
 		const QJsonObject grid = CapturePreviewGrid(image, job->par);
+		int inside = 0;
+		int total = 0;
+		for (const QJsonValue &cell : grid.value("cells").toArray())
+		{
+			total++;
+			if (cell.toObject().value("label").toString() == QLatin1String("inside")) inside++;
+		}
+		const bool cameraInside = total > 0 && inside * 4 >= total;
 		QMutexLocker locker(&job->mutex);
 		job->previewGrid = grid;
+		job->cameraInside = cameraInside;
 	}
 	return true;
 }
@@ -1342,7 +1382,10 @@ void PumpQueues()
 			}
 			QMutexLocker jobLock(&next->mutex);
 			next->started = true;
+			next->startedAt = QDateTime::currentMSecsSinceEpoch();
 			next->status = QString("running");
+			if (next->message.contains(QString("Waiting")))
+				next->message = QObject::tr("Rendering");
 			next->useCheckpoint = lane == QLatin1String("main") && !next->draft;
 			starting.append(next);
 		};
@@ -1367,13 +1410,25 @@ void PumpQueues()
 	}
 }
 
+QString FormatWall(qint64 milliseconds);
+
 void FinishJob(const std::shared_ptr<sJob> &job, const QString &status, const QString &error)
 {
 	{
 		QMutexLocker locker(&job->mutex);
 		job->status = status;
 		job->error = error;
-		if (status == "finished") job->progress = 1;
+		if (status == "finished")
+		{
+			job->progress = 1;
+			const qint64 now = QDateTime::currentMSecsSinceEpoch();
+			const qint64 elapsed = job->startedAt > 0 ? now - job->startedAt : 0;
+			job->message = QObject::tr("Finished, total time: %1").arg(FormatWall(elapsed));
+		}
+		else if (status == "failed" || status == "stopped" || status == "cancelled")
+		{
+			job->message = error.isEmpty() ? status : error;
+		}
 		if (!job->imagePath.isEmpty()) SetLastImage(job->imagePath);
 		job->finishedAt = QDateTime::currentMSecsSinceEpoch();
 		job->done.store(true);
@@ -1497,12 +1552,21 @@ void RunAnimation(const std::shared_ptr<sJob> job, const QString &mode, int star
 	if (!job->stop && job->useCheckpoint) renderCheckpoint::Finish();
 }
 
-QString FormulaLabel(const std::shared_ptr<cFractalContainer> &fractal)
+QString FormulaLabel(const std::shared_ptr<cParameterContainer> &par,
+	const std::shared_ptr<cFractalContainer> &fractal)
 {
 	if (!fractal) return QString();
+	QSet<int> drawn;
+	if (par)
+	{
+		const QList<int> drawnSlots = mcpScene::DrawnFormulaSlots(par);
+		for (int slot : drawnSlots)
+			drawn.insert(slot);
+	}
 	QStringList names;
 	for (int i = 0; i < fractal->size(); i++)
 	{
+		if (!drawn.isEmpty() && !drawn.contains(i + 1)) continue;
 		const std::shared_ptr<cParameterContainer> slot = fractal->at(i);
 		if (!slot) continue;
 		if (slot->IfExists("fractal_enable") && !slot->Get<bool>("fractal_enable")) continue;
@@ -1545,7 +1609,7 @@ void DescribeJob(const std::shared_ptr<sJob> &job)
 	if (detail > 0) bits << QObject::tr("detail %1").arg(QString::number(detail, 'g', 4));
 	if (job->frameCount > 1) bits << QObject::tr("%1 frames").arg(job->frameCount);
 	QStringList lines;
-	const QString formulas = FormulaLabel(job->fractal);
+	const QString formulas = FormulaLabel(job->par, job->fractal);
 	if (!formulas.isEmpty()) lines << formulas;
 	lines << bits.join(QString(" · "));
 	const QString path = QDir::toNativeSeparators(QFileInfo(job->outputDirectory).absoluteFilePath());
@@ -1576,7 +1640,42 @@ void Launch(const std::shared_ptr<sJob> &job, const QString &kind,
 	PumpQueues();
 }
 
-QJsonObject JobStatus(const std::shared_ptr<sJob> &job)
+QString FormatWall(qint64 milliseconds)
+{
+	const double seconds = qMax(0.0, milliseconds / 1000.0);
+	if (seconds < 60.0) return QString::number(seconds, 'f', 1) + QString("s");
+	const int minutes = int(seconds) / 60;
+	return QString("%1m %2s").arg(minutes).arg(QString::number(std::fmod(seconds, 60.0), 'f', 1));
+}
+
+QJsonObject ClientGrid(const QJsonObject &grid, bool full)
+{
+	if (grid.isEmpty()) return grid;
+	if (full)
+	{
+		QJsonObject copy = grid;
+		copy["grid"] = QString("full");
+		return copy;
+	}
+	QJsonObject copy;
+	const QStringList keep = {"columns", "rows", "best", "prefer", "camera", "target", "fov"};
+	for (const QString &key : keep)
+	{
+		if (grid.contains(key)) copy[key] = grid.value(key);
+	}
+	const QJsonArray ranked = grid.value("ranked").toArray();
+	QJsonArray top;
+	for (int i = 0; i < ranked.size() && top.size() < 5; i++)
+		top.append(ranked.at(i));
+	copy["ranked"] = top;
+	copy["ranked_total"] = ranked.size();
+	copy["grid"] = QString("best");
+	copy["note"] =
+		"best and the top five ranked cells. Pass grid full for every cell.";
+	return copy;
+}
+
+QJsonObject JobStatus(const std::shared_ptr<sJob> &job, bool fullGrid = false)
 {
 	QMutexLocker locker(&job->mutex);
 	QJsonObject result;
@@ -1590,7 +1689,8 @@ QJsonObject JobStatus(const std::shared_ptr<sJob> &job)
 	if (!job->error.isEmpty()) result["error"] = job->error;
 	if (!job->outputDirectory.isEmpty()) result["output"] = job->outputDirectory;
 	if (!job->imagePath.isEmpty()) result["image"] = job->imagePath;
-	if (!job->previewGrid.isEmpty()) result["grid"] = job->previewGrid;
+	if (!job->previewGrid.isEmpty()) result["grid"] = ClientGrid(job->previewGrid, fullGrid);
+	if (job->cameraInside) result["camera_inside"] = true;
 	if (!job->contactSheetPath.isEmpty()) result["contact_sheet"] = job->contactSheetPath;
 	if (!job->note.isEmpty()) result["note"] = job->note;
 	if (!job->title.isEmpty()) result["title"] = job->title;
@@ -1613,7 +1713,7 @@ QJsonObject JobStatus(const std::shared_ptr<sJob> &job)
 	return result;
 }
 
-QJsonObject WaitFor(const std::shared_ptr<sJob> &job)
+QJsonObject WaitFor(const std::shared_ptr<sJob> &job, bool fullGrid = false)
 {
 	QEventLoop loop;
 	QTimer timer;
@@ -1623,7 +1723,7 @@ QJsonObject WaitFor(const std::shared_ptr<sJob> &job)
 	});
 	timer.start();
 	loop.exec();
-	QJsonObject result = JobStatus(job);
+	QJsonObject result = JobStatus(job, fullGrid);
 	const QString status = result.value("status").toString();
 	if (status == "failed" || status == "stopped" || status == "cancelled")
 	{
@@ -1827,6 +1927,13 @@ QJsonObject UpdateObject(const QJsonObject &params)
 	if (params.contains("name")) name = params.value("name").toString();
 	if (params.contains("parent_id") || params.contains("name"))
 		WriteDefinition(nodeId, name, node->type, parentId, node->objectId, node->displayOrder);
+	if (params.contains("radius"))
+	{
+		QString written;
+		QString error;
+		if (!SetPrimitiveSize(nodeId, params.value("radius").toDouble(), &written, &error))
+			return Fail(error);
+	}
 	Remember();
 	return TreeResult();
 }
@@ -2497,10 +2604,15 @@ QJsonObject ProbeView(const QJsonObject &params)
 				gPreviewGrid = stored;
 			}
 		}
-		QJsonObject result = stored;
+		const bool fullCells = params.value("cells").toString() == QLatin1String("full")
+													 || params.value("grid").toString() == QLatin1String("full");
+		QJsonObject result = ClientGrid(stored, fullCells);
 		result["preview_matches"] = matches;
 		if (!matches)
 			result["note"] = "The camera or fov changed after this preview, so column and row are stale. render_preview again.";
+		else if (!fullCells && result.value("note").toString().isEmpty())
+			result["note"] =
+				"best and the top five ranked cells. Pass cells full, or grid full, for every cell.";
 		return result;
 	}
 	if (params.contains("prefer"))
@@ -3614,8 +3726,50 @@ QJsonObject SetCamera(const QJsonObject &params)
 	return result;
 }
 
+bool AnimationRenderRunning()
+{
+	QMutexLocker locker(&gJobsMutex);
+	for (auto it = gJobs.constBegin(); it != gJobs.constEnd(); ++it)
+	{
+		const std::shared_ptr<sJob> job = it.value();
+		if (!job || job->done.load()) continue;
+		if (job->kind == QLatin1String("keyframe") || job->kind == QLatin1String("flight")) return true;
+	}
+	return false;
+}
+
+int gAnimationEditDepth = 0;
+
+struct sAnimationGuard
+{
+	bool ok = false;
+	QString error;
+	sAnimationGuard()
+	{
+		if (AnimationRenderRunning())
+		{
+			error =
+				"An animation is rendering. Wait for it, or stop_render, before editing keyframes or the flight path.";
+			return;
+		}
+		if (gAnimationEditDepth > 0)
+		{
+			error = "An animation edit is already in progress.";
+			return;
+		}
+		gAnimationEditDepth++;
+		ok = true;
+	}
+	~sAnimationGuard()
+	{
+		if (ok) gAnimationEditDepth--;
+	}
+};
+
 QJsonObject AddKeyframe(const QJsonObject &params)
 {
+	const sAnimationGuard guard;
+	if (!guard.ok) return Fail(guard.error);
 	const int between = params.value("frames_per_keyframe").toInt(4);
 	if (between < 1 || between > 10000) return Fail("frames_per_keyframe must be 1 to 10000.");
 	EnsureAnimated(gKeyframes.get(),
@@ -3638,29 +3792,94 @@ QJsonObject AddKeyframe(const QJsonObject &params)
 
 QJsonObject UpdateKeyframe(const QJsonObject &params)
 {
+	const sAnimationGuard guard;
+	if (!guard.ok) return Fail(guard.error);
 	const int index = params.value("index").toInt(-1);
 	if (index < 0 || index >= gKeyframes->GetNumberOfFrames())
 		return Fail("index must be an existing key.");
 	cAnimationFrames::sAnimationFrame frame = gKeyframes->GetFrame(index);
-	if (params.contains("frames_per_keyframe"))
-		frame.numberOfSubFrames = params.value("frames_per_keyframe").toInt(frame.numberOfSubFrames);
-	const QStringList names = {"camera", "target", "camera_rotation", "fov", "camera_distance_to_target"};
-	for (const QString &name : names)
+	const bool hasFrames = params.contains("frames_per_keyframe");
+	const bool hasCamera = params.contains("camera");
+	const bool hasTarget = params.contains("target");
+	const bool hasRotation = params.contains("rotation");
+	const bool hasFov = params.contains("fov");
+	const bool hasDistance = params.contains("distance");
+	const bool poseFields = hasCamera || hasTarget || hasRotation || hasFov || hasDistance;
+	if (hasFrames)
 	{
+		const int between = params.value("frames_per_keyframe").toInt(0);
+		if (between < 1 || between > 10000) return Fail("frames_per_keyframe must be 1 to 10000.");
+		frame.numberOfSubFrames = between;
+	}
+	auto copyLive = [&](const QString &name) {
 		const QString full = "main_" + name;
-		if (!frame.parameters.IfExists(full) || !gPar->IfExists(name)) continue;
+		if (!frame.parameters.IfExists(full) || !gPar->IfExists(name)) return;
 		cOneParameter value = gPar->GetAsOneParameter(name);
 		value.SetMorphType(frame.parameters.GetAsOneParameter(full).GetMorphType());
 		frame.parameters.SetFromOneParameter(full, value);
+	};
+	auto writeVec = [&](const QString &full, const CVector3 &value) {
+		if (!frame.parameters.IfExists(full)) return;
+		cOneParameter stored = frame.parameters.GetAsOneParameter(full);
+		stored.Set(value, valueActual);
+		frame.parameters.SetFromOneParameter(full, stored);
+	};
+	if (!hasFrames && !poseFields)
+	{
+		const QStringList names = {"camera", "target", "camera_rotation", "fov", "camera_distance_to_target"};
+		for (const QString &name : names)
+			copyLive(name);
+	}
+	else if (poseFields)
+	{
+		QString error;
+		if (hasCamera)
+		{
+			CVector3 camera;
+			if (!ParseVec3(params.value("camera"), &camera, &error)) return Fail(error);
+			writeVec("main_camera", camera);
+		}
+		if (hasTarget)
+		{
+			CVector3 target;
+			if (!ParseVec3(params.value("target"), &target, &error)) return Fail(error);
+			writeVec("main_target", target);
+		}
+		if (hasRotation)
+		{
+			CVector3 rotation;
+			if (!ParseVec3(params.value("rotation"), &rotation, &error)) return Fail(error);
+			writeVec("main_camera_rotation", rotation);
+		}
+		if (hasFov && frame.parameters.IfExists("main_fov"))
+		{
+			cOneParameter stored = frame.parameters.GetAsOneParameter("main_fov");
+			stored.Set(params.value("fov").toDouble(), valueActual);
+			frame.parameters.SetFromOneParameter("main_fov", stored);
+		}
+		if (hasDistance && frame.parameters.IfExists("main_camera_distance_to_target"))
+		{
+			cOneParameter stored = frame.parameters.GetAsOneParameter("main_camera_distance_to_target");
+			stored.Set(params.value("distance").toDouble(), valueActual);
+			frame.parameters.SetFromOneParameter("main_camera_distance_to_target", stored);
+		}
 	}
 	gKeyframes->ModifyFrame(index, frame);
 	gKeyframes->UpdateFramesIndexesTable();
 	Remember();
-	return AnimationState();
+	QJsonObject result = AnimationState();
+	result["updated"] = index;
+	result["key"] = KeyframeJson(index);
+	if (hasFrames && !poseFields)
+		result["note"] =
+			"Only frames_per_keyframe changed. Camera, target, rotation, fov, and distance on this key were left as stored.";
+	return result;
 }
 
 QJsonObject DeleteKeyframe(const QJsonObject &params)
 {
+	const sAnimationGuard guard;
+	if (!guard.ok) return Fail(guard.error);
 	const int index = params.value("index").toInt(-1);
 	if (index < 0 || index >= gKeyframes->GetNumberOfFrames())
 		return Fail("index must be an existing key.");
@@ -3672,6 +3891,8 @@ QJsonObject DeleteKeyframe(const QJsonObject &params)
 
 QJsonObject SetFlightPath(const QJsonObject &params)
 {
+	const sAnimationGuard guard;
+	if (!guard.ok) return Fail(guard.error);
 	QString kind = params.value("kind").toString();
 	if (kind.isEmpty()) kind = params.value("frames").isArray() ? "frames" : "orbit";
 	const bool explicitFrames = params.value("frames").isArray();
@@ -3718,6 +3939,12 @@ QJsonObject SetFlightPath(const QJsonObject &params)
 	{
 		return Fail("kind must be orbit, flythrough, or frames.");
 	}
+	if (kind == "orbit")
+	{
+		const double sweep = params.value("sweep").toDouble(360.0);
+		if (!(sweep > 0.0) || sweep > 360.0)
+			return Fail("sweep is degrees of arc, from just above 0 to 360. 360 is a full circle.");
+	}
 
 	gAnimFrames->ClearAll();
 	EnsureAnimated(gAnimFrames.get(),
@@ -3740,9 +3967,13 @@ QJsonObject SetFlightPath(const QJsonObject &params)
 			params.value("radius").toDouble(gPar->Get<double>("camera_distance_to_target"));
 		const double height = params.value("height").toDouble(gPar->Get<CVector3>("camera").z);
 		const double fov = params.value("fov").toDouble(gPar->Get<double>("fov"));
+		const double sweep = params.value("sweep").toDouble(360.0);
+		const bool fullCircle = sweep >= 359.999;
+		const double span = sweep * M_PI / 180.0;
 		for (int i = 0; i < count; i++)
 		{
-			const double angle = 2.0 * M_PI * double(i) / double(count);
+			const double angle = fullCircle ? 2.0 * M_PI * double(i) / double(count)
+																			 : span * double(i) / double(qMax(1, count - 1));
 			const CVector3 camera(orbitTarget.x + radius * std::sin(angle),
 				orbitTarget.y - radius * std::cos(angle), orbitTarget.z + height);
 			capture(camera, orbitTarget, fov);
@@ -3766,10 +3997,13 @@ QJsonObject SetFlightPath(const QJsonObject &params)
 	Remember();
 	QJsonObject result = AnimationState();
 	result["kind"] = kind;
+	if (kind == "orbit") result["sweep"] = params.value("sweep").toDouble(360.0);
 	result["note"] =
 		"This replaced the flight path. It did not change keyframes. Render it with "
-		"render_animation mode flight. Orbit looks at one target from a circle. A fly-through "
-		"moves the eye in a straight line; keep the target on the shape or the frame goes empty.";
+		"render_animation mode flight. Orbit looks at one target. sweep is degrees of that arc "
+		"and defaults to 360, a full circle. A shorter sweep starts at the current side of the "
+		"target and does not repeat the first frame. A fly-through moves the eye in a straight "
+		"line; keep the target on the shape or the frame goes empty.";
 	return result;
 }
 
@@ -3818,38 +4052,119 @@ QJsonObject FrameScene(const QJsonObject &params)
 	const int depth = GetObjectTreeRequiredStackDepth(renderData.nodesDataForRendering);
 	std::vector<ObjectTreeStackFrame> objectStack(size_t(qMax(1, depth)));
 
-	const int rays = qBound(8, params.value("rays").toInt(36), 100);
-	double maxDist = 0.0;
-	for (int i = 0; i < rays; i++)
+	bool mandelbox = false;
 	{
-		CVector3 direction(Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0);
-		if (direction.Length() < 1e-8) continue;
-		direction.Normalize();
-		double distStep = 1.0;
-		double scan = 100.0;
-		for (; scan > 0.0; scan -= distStep)
+		QList<int> drawnSlots = mcpScene::DrawnFormulaSlots(gPar);
+		if (drawnSlots.isEmpty())
 		{
-			const CVector3 point = lookAt + direction * scan;
-			sDistanceIn in(point, 0, false);
-			sDistanceOut out;
-			const double dist =
-				CalculateDistance(*renderParams, fractals, in, &out, &renderData, &objectStack);
-			// A NaN distance would otherwise spin. Treat it as a hit and stop.
-			if (!(dist > 0.1)) break;
-			distStep = dist * deFactor * 0.5;
-			if (distStep > 1.0) distStep = 1.0;
-			if (distStep < 1e-3) distStep = 1e-3;
+			for (int i = 0; i < gParFractal->size(); i++)
+				drawnSlots.append(i + 1);
 		}
-		if (scan > maxDist) maxDist = scan;
+		for (int slot : drawnSlots)
+		{
+			if (slot < 1 || slot > gParFractal->size()) continue;
+			const int formulaId = gParFractal->at(slot - 1)->Get<int>("formula");
+			for (cAbstractFractal *formula : newFractalList)
+			{
+				if (int(formula->getInternalId()) != formulaId) continue;
+				const QString internal = QString::fromStdString(formula->getInternalName()).toLower();
+				if (internal.contains("mandelbox") || internal.contains("abox") || internal.contains("boxfold"))
+					mandelbox = true;
+				break;
+			}
+		}
+	}
+	const QString boxHint = mandelbox
+		? QString(" This formula is a Mandelbox. If the picture is empty, set mandelbox_scale to -1.5 "
+							"(the stored default of 2 is a solid the default camera sits inside).")
+		: QString();
+
+	const int rays = qBound(8, params.value("rays").toInt(36), 100);
+	auto scanShell = [&](double limit, double *maxReliable, int *reliable) {
+		*maxReliable = 0.0;
+		*reliable = 0;
+		for (int i = 0; i < rays; i++)
+		{
+			CVector3 direction(Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0, Random(1000) / 500.0 - 1.0);
+			if (direction.Length() < 1e-8) continue;
+			direction.Normalize();
+			double distStep = 1.0;
+			double scan = limit;
+			bool first = true;
+			bool capped = false;
+			for (; scan > 0.0; scan -= distStep)
+			{
+				const CVector3 point = lookAt + direction * scan;
+				sDistanceIn in(point, 0, false);
+				sDistanceOut out;
+				const double dist =
+					CalculateDistance(*renderParams, fractals, in, &out, &renderData, &objectStack);
+				// A NaN distance would otherwise spin. Treat it as a hit and stop.
+				if (!(dist > 0.1))
+				{
+					if (first) capped = true;
+					break;
+				}
+				first = false;
+				distStep = dist * deFactor * 0.5;
+				if (distStep > 1.0) distStep = 1.0;
+				if (distStep < 1e-3) distStep = 1e-3;
+			}
+			// A hit on the first sample is the scan limit, which for pseudo Kleinian is the
+			// bailout sphere rather than the cluster.
+			if (capped || scan > limit * 0.92) continue;
+			if (scan > *maxReliable) *maxReliable = scan;
+			(*reliable)++;
+		}
+	};
+
+	// Outside in. A wide shell can report a halo well inside the bailout, so keep
+	// going and use the tightest shell that still finds a surface. Stop once a
+	// tighter shell finds nothing: the eye is then inside the shape the outer
+	// shell measured.
+	const double shells[] = {100.0, 24.0, 8.0, 3.0};
+	double maxDist = 0.0;
+	bool found = false;
+	for (double limit : shells)
+	{
+		double reliable = 0.0;
+		int count = 0;
+		scanShell(limit, &reliable, &count);
+		if (count == 0)
+		{
+			if (found) break;
+			continue;
+		}
+		maxDist = reliable;
+		found = true;
+	}
+
+	const CVector3 currentCamera = gPar->Get<CVector3>("camera");
+	if (!found)
+	{
+		QJsonObject result;
+		result["camera"] = QJsonArray{currentCamera.x, currentCamera.y, currentCamera.z};
+		result["target"] = QJsonArray{gPar->Get<CVector3>("target").x, gPar->Get<CVector3>("target").y,
+			gPar->Get<CVector3>("target").z};
+		result["distance"] = gPar->Get<double>("camera_distance_to_target");
+		result["measured_radius"] = shells[0];
+		result["measurement_unreliable"] = true;
+		result["camera_moved"] = false;
+		result["note"] =
+			"Measurement looks like the escape sphere. The scan hit its outer limit before a closer "
+			"surface, so the camera was not moved. Place the camera a few units from the target and "
+			"preview."
+			+ boxHint;
+		return result;
 	}
 
 	if (maxDist < 0.05)
 	{
 		return Fail(
 			"Could not find a surface within the scan. The formula may be empty, the scale may have "
-			"collapsed the shape, or it sits far from the target. For a Mandelbox, set "
-			"mandelbox_scale to -1.5 (the stored default of 2 is a solid the default camera sits "
-			"inside). Or pass target where the shape should be, then call frame_scene again.");
+			"collapsed the shape, or it sits far from the target. Pass target where the shape should "
+			"be, then call frame_scene again."
+			+ boxHint);
 	}
 
 	double newDist;
@@ -3873,10 +4188,13 @@ QJsonObject FrameScene(const QJsonObject &params)
 	result["target"] = QJsonArray{lookAt.x, lookAt.y, lookAt.z};
 	result["distance"] = newDist;
 	result["measured_radius"] = maxDist;
+	result["measurement_unreliable"] = false;
+	result["camera_moved"] = true;
 	result["note"] =
 		"The camera was pulled back until the measured surface fits the frame, looking at the "
 		"target. The viewing direction was kept. One undo step. The formula was not changed. "
-		"render_preview to check. If the frame is still empty, set mandelbox_scale to -1.5.";
+		"render_preview to check."
+		+ boxHint;
 	return result;
 }
 
@@ -3921,10 +4239,11 @@ QJsonObject RenderStill(const QJsonObject &params, bool waitForResult)
 	const int width = job->width;
 	const int height = job->height;
 	const bool draft = job->draft;
+	const bool fullGrid = params.value("grid").toString() == QLatin1String("full");
 	Launch(job, waitForResult ? "preview" : "still", [](std::shared_ptr<sJob> live) { RunStill(live); });
 	if (!waitForResult)
 	{
-		QJsonObject result = JobStatus(job);
+		QJsonObject result = JobStatus(job, fullGrid);
 		result["note"] =
 			"Full stills wait in the main queue and run one at a time. Previews and draft or better "
 			"jobs wait in the agent queue, which keeps running while a main render is in progress. "
@@ -3933,18 +4252,34 @@ QJsonObject RenderStill(const QJsonObject &params, bool waitForResult)
 			"The live session was not changed; this job used a copy.";
 		return result;
 	}
-	QJsonObject result = WaitFor(job);
+	QJsonObject result = WaitFor(job, fullGrid);
 	if (result.value("ok").toBool(true) == false && result.contains("error")
 		&& result.value("status").toString() != "finished")
 		return result;
 	result["path"] = job->imagePath;
 	result["width"] = width;
 	result["height"] = height;
-	result["note"] = draft
-		? "Draft preview from a copy. The session's resolution and expensive effects were not changed. "
-			"The window stayed responsive while this ran."
-		: "Still render from a copy of the session. Quality and effects are the session's. The window "
+	QString qualityNote;
+	if (job->quality == QLatin1String("draft"))
+		qualityNote =
+			"Draft preview from a copy. The session's resolution and expensive effects were not changed. "
+			"The window stayed responsive while this ran.";
+	else if (job->quality == QLatin1String("better"))
+		qualityNote =
+			"Better preview from a copy. Detail is capped at 1. The session's resolution and expensive "
+			"effects were not changed. The window stayed responsive while this ran.";
+	else
+		qualityNote =
+			"Still render from a copy of the session. Quality and effects are the session's. The window "
 			"stayed responsive while this ran.";
+	if (job->cameraInside)
+	{
+		qualityNote +=
+			" The eye is inside the shape (camera_inside). Pull the camera back before a longer render.";
+		result["camera_inside"] = true;
+	}
+	result["note"] = qualityNote;
+	Q_UNUSED(draft);
 	return result;
 }
 
@@ -4192,10 +4527,126 @@ QJsonObject ResumeRender(const QJsonObject &params)
 		"background job.";
 	return result;
 }
+
+QJsonObject NewScene()
+{
+	if (!gPar || !gParFractal) return Fail("No session.");
+	const QString saveTarget = systemData.lastSettingsFile;
+	const QStringList names = gPar->GetListOfParameters();
+	for (const QString &name : names)
+	{
+		if (name.startsWith(QLatin1String("node_")) || name.startsWith(QLatin1String("primitive_")))
+			gPar->DeleteParameter(name);
+	}
+	gPar->ResetAllToDefault();
+	for (int i = 0; i < gParFractal->size(); i++)
+		gParFractal->at(i)->ResetAllToDefault();
+	int formulaId = 0;
+	QString internal;
+	QString display;
+	if (!FindFormula(QString("mandelbulb"), &formulaId, &internal, &display))
+		return Fail("Mandelbulb is not available in this build.");
+	gParFractal->at(0)->Set("formula", formulaId);
+	for (int i = 1; i < gParFractal->size(); i++)
+		gParFractal->at(i)->Set("formula", int(fractal::none));
+	WriteDefinition(1, internal.isEmpty() ? QString("mandelbulb") : internal, enumNodeType::fractal, 0, 1, 1);
+	if (gAnimFrames) gAnimFrames->ClearAll();
+	if (gKeyframes) gKeyframes->ClearAll();
+	systemData.lastSettingsFile = saveTarget;
+	Remember();
+	QJsonObject result = TreeResult();
+	result["loaded_file"] = saveTarget;
+	result["save_target_changed"] = false;
+	result["note"] =
+		"One Mandelbulb at the world, the default camera, and an empty flight path and key list. "
+		"One undo step. No file was written. The window's Save target was left unchanged.";
+	return result;
+}
+
+QMutex gUndoActionMutex;
+QString gPendingUndoAction;
+QStringList gUndoActions;
+QStringList gRedoActions;
 } // namespace
 
 namespace mcpScene
 {
+void NoteUndoAction(const QString &action)
+{
+	QMutexLocker locker(&gUndoActionMutex);
+	gPendingUndoAction = action;
+}
+
+void CommitUndoAction()
+{
+	QMutexLocker locker(&gUndoActionMutex);
+	if (gPendingUndoAction.isEmpty()) return;
+	gUndoActions.append(gPendingUndoAction);
+	gPendingUndoAction.clear();
+	gRedoActions.clear();
+}
+
+void ClearPendingUndoAction()
+{
+	QMutexLocker locker(&gUndoActionMutex);
+	gPendingUndoAction.clear();
+}
+
+QString TakeUndoneAction()
+{
+	QMutexLocker locker(&gUndoActionMutex);
+	const QString action = gUndoActions.isEmpty() ? QString("edit") : gUndoActions.takeLast();
+	gRedoActions.append(action);
+	return action;
+}
+
+QString TakeRedoneAction()
+{
+	QMutexLocker locker(&gUndoActionMutex);
+	const QString action = gRedoActions.isEmpty() ? QString("edit") : gRedoActions.takeLast();
+	gUndoActions.append(action);
+	return action;
+}
+
+QList<int> DrawnFormulaSlots(const std::shared_ptr<cParameterContainer> &par)
+{
+	QList<int> drawn;
+	if (!par) return drawn;
+	cObjectsTree tree;
+	const QList<cObjectsTree::sNodeListItem> nodes = tree.GetListOfNodes(par);
+	QHash<int, int> parentOf;
+	QHash<int, bool> enabled;
+	for (const cObjectsTree::sNodeListItem &node : nodes)
+	{
+		parentOf.insert(node.id, node.parentId);
+		const QString prefix = QString("node_%1_").arg(node.id, 4, 10, QChar('0'));
+		bool on = true;
+		if (par->IfExists(prefix + "enabled")) on = par->Get<bool>(prefix + "enabled");
+		enabled.insert(node.id, on);
+	}
+	auto live = [&](int id) {
+		int guard = 0;
+		while (id != 0 && guard++ < 1000)
+		{
+			if (enabled.contains(id) && !enabled.value(id)) return false;
+			if (!parentOf.contains(id)) break;
+			id = parentOf.value(id);
+		}
+		return true;
+	};
+	QSet<int> seen;
+	for (const cObjectsTree::sNodeListItem &node : nodes)
+	{
+		if (node.type != enumNodeType::fractal) continue;
+		if (node.objectId < 1) continue;
+		if (!live(node.id)) continue;
+		if (seen.contains(node.objectId)) continue;
+		seen.insert(node.objectId);
+		drawn.append(node.objectId);
+	}
+	return drawn;
+}
+
 bool JobActive()
 {
 	QMutexLocker locker(&gJobsMutex);
@@ -4286,6 +4737,7 @@ QJsonArray Checkpoints()
 bool Dispatch(const QString &method, const QJsonObject &params, QJsonObject *result)
 {
 	if (method == "get_objects_tree") *result = ObjectsTree();
+	else if (method == "new_scene") *result = NewScene();
 	else if (method == "add_object") *result = AddObject(params);
 	else if (method == "update_object") *result = UpdateObject(params);
 	else if (method == "delete_object") *result = DeleteObject(params);
@@ -4331,7 +4783,7 @@ bool Dispatch(const QString &method, const QJsonObject &params, QJsonObject *res
 		const std::shared_ptr<sJob> job = gJobs.value(id);
 		if (!job) *result = Fail("No render job. Pass id, or start one with render_still or render_animation.");
 		else
-			*result = JobStatus(job);
+			*result = JobStatus(job, params.value("grid").toString() == QLatin1String("full"));
 	}
 	else if (method == "resume_render") *result = ResumeRender(params);
 	else if (method == "stop_render")

@@ -6,14 +6,18 @@
 
 #include "mcp_catalog.h"
 
+#include <algorithm>
+
 #include <QDir>
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMap>
 #include <QRegularExpression>
 #include <QSet>
+#include <QVector>
 #include <QXmlStreamReader>
 
 #include "fractal_container.hpp"
@@ -373,9 +377,24 @@ const QHash<QString, QString> &GlossaryMap()
 			"Relative influence of this formula when several formulas are mixed. Higher weight pulls the "
 			"shape toward this formula."},
 		{"power",
-			"The exponent of power-family formulas such as Mandelbulb and Mandelbox. Mandelbulb power 8 "
+			"The exponent of power-family formulas such as Mandelbulb and Quaternion. Mandelbulb power 8 "
 			"is the classic bulb. 2 is a smoother ball, 3 to 6 are more folded, 9 is this program's "
-			"default. Integers are the usual starting point; fractions add twist."},
+			"default. Integers are the usual starting point; fractions add twist. This is not the "
+			"Mandelbox size. That control is mandelbox_scale, and -1.5 is the Amazing Box."},
+		{"distance_fog_shadows",
+			"Shadows for distance fog. This is not the basic-fog shadow switch."},
+		{"distance_fog_primitive",
+			"Primitive that limits where distance fog appears. This is not the basic-fog primitive."},
+		{"iteration_fog_shadows",
+			"Shadows for iteration fog. This is not the basic-fog shadow switch."},
+		{"iteration_fog_primitive",
+			"Primitive that limits where iteration fog appears. This is not the basic-fog primitive."},
+		{"iteration_fog_opacity_trim_high",
+			"No iteration fog where the iteration count is higher than this. iteration_fog_opacity_trim is the lower cutoff."},
+		{"iteration_fog_color_1_maxiter",
+			"A number, not a color. Color 1 is used while the iteration count is below this value."},
+		{"iteration_fog_color_2_maxiter",
+			"A number, not a color. Color 2 is used below this iteration count, and color 3 above it."},
 		{"bailout",
 			"Iteration escape radius. When use_default_bailout is on, the formula's own default is used "
 			"instead. Larger bailout stops earlier and softens detail."},
@@ -475,7 +494,7 @@ QString AreaOf(const QString &name)
 	if (name.contains("ambient_occlusion") || name.startsWith("DOF") || name.startsWith("glow")
 		|| name.contains("volumetric") || name.contains("fog") || name.contains("reflect")
 		|| name.startsWith("hdr") || name.startsWith("ssao") || name.startsWith("brightness")
-		|| name == "gamma" || name == "contrast")
+		|| name.startsWith("background_color") || name == "gamma" || name == "contrast")
 		return "effects";
 	if (name == "N" || name.startsWith("detail") || name.startsWith("DE_") || name.startsWith("image_")
 		|| name.contains("raymarch") || name.startsWith("limit_") || name == "view_distance_max"
@@ -736,37 +755,58 @@ QJsonArray ListFormulas(const QString &query, int limit)
 	if (limit <= 0) limit = 20;
 	if (limit > 50) limit = 50;
 	const QString needle = query.trimmed().toLower();
-	QJsonArray array;
+	struct sHit
+	{
+		int rank = 3;
+		int order = 0;
+		QJsonObject object;
+	};
+	QVector<sHit> hits;
+	int order = 0;
 	for (cAbstractFractal *formula : newFractalList)
 	{
 		if (formula->getInternalId() == fractal::none) continue;
 		const QString internalName = QString::fromStdString(formula->getInternalName());
 		const QString displayName = QString::fromStdString(formula->getNameInComboBox());
+		const QString internalLower = internalName.toLower();
+		const QString displayLower = displayName.toLower();
 		sFormulaInfo *info = FindFormula(internalName);
 		QString summary;
+		int rank = 0;
 		if (!needle.isEmpty())
 		{
-			const bool nameHit = internalName.toLower().contains(needle)
-													 || displayName.toLower().contains(needle);
-			if (!nameHit && info)
+			if (internalLower == needle || displayLower == needle)
+				rank = 0;
+			else if (internalLower.startsWith(needle) || displayLower.startsWith(needle))
+				rank = 1;
+			else if (internalLower.contains(needle) || displayLower.contains(needle))
+				rank = 2;
+			else if (info)
 			{
 				EnsureFormulaParsed(info);
 				summary = info->summary;
 				if (!summary.toLower().contains(needle)) continue;
+				rank = 3;
 			}
-			else if (!nameHit)
-			{
+			else
 				continue;
-			}
 		}
 		if (summary.isEmpty() && info && info->parsed) summary = info->summary;
 		QJsonObject object;
 		object["internal_name"] = internalName;
 		object["display_name"] = displayName;
 		object["id"] = int(formula->getInternalId());
-		if (!summary.isEmpty())
-			object["summary"] = summary.left(280);
-		array.append(object);
+		if (!summary.isEmpty()) object["summary"] = summary.left(280);
+		hits.append(sHit{rank, order++, object});
+	}
+	std::sort(hits.begin(), hits.end(), [](const sHit &a, const sHit &b) {
+		if (a.rank != b.rank) return a.rank < b.rank;
+		return a.order < b.order;
+	});
+	QJsonArray array;
+	for (const sHit &hit : hits)
+	{
+		array.append(hit.object);
 		if (array.size() >= limit) break;
 	}
 	return array;
@@ -800,11 +840,14 @@ QString WhereHint(const QString &internalName, fractal::enumDEType type, fractal
 					 "places are the holes and the edges, not the empty space outside.";
 	}
 	if (ifs)
-		return "An IFS lives around the origin. formula_scale is the size. The interesting places are the "
-					 "folds, not the empty space outside. frame_scene if the picture is empty.";
+		return "An IFS lives around the origin. IFS_scale is the size (often 2), not formula_scale. "
+					 "The interesting places are the folds, not the empty space outside. frame_scene if the "
+					 "picture is empty.";
 	if (klein)
-		return "A Kleinian lives in a cluster of spheres around the origin. Frame the cluster, then move "
-					 "toward a cusp, which shows up as an edge or ridge cell.";
+		return "A Kleinian lives in a cluster of spheres a few units across, not on the bailout sphere. "
+					 "frame_scene refuses a measurement that only hits that sphere. A camera a few units from "
+					 "the origin, such as [0, -4.5, 1.6] looking at [0, 0, 0.2], is a known-good start. Then "
+					 "move toward a cusp, which shows up as an edge or ridge cell.";
 	if (type == fractal::analyticDEType)
 		return "The shape is the surface where the distance estimate reaches zero, usually within a few "
 					 "units of the origin. frame_scene if the picture is empty or the eye is inside. Ranked "
@@ -813,7 +856,7 @@ QString WhereHint(const QString &internalName, fractal::enumDEType type, fractal
 				 "where that estimate reaches zero. frame_scene if the picture is empty or the eye is inside.";
 }
 
-QJsonObject DescribeFormula(const QString &name, QString *error)
+QJsonObject DescribeFormula(const QString &name, QString *error, bool verbose)
 {
 	sFormulaInfo *info = FindFormula(name);
 	if (!info)
@@ -850,13 +893,104 @@ QJsonObject DescribeFormula(const QString &name, QString *error)
 	object["example_files"] = examples;
 	object["how_to_select"] = QString(
 		"Call set_formula with slot 1 to 9 and internal_name '%1' (the display name also works). "
-		"Slot 1 is the default object. Extra slots do nothing until a hybrid or boolean in the objects "
-		"tree uses them; building that tree is the next slice, but the slot's formula integer is what "
-		"the ray marcher reads.")
+		"A fractal node draws the formula in its object_id slot. Extra slots do nothing until the "
+		"objects tree uses them. clear_formula empties a slot no node draws. new_scene installs one "
+		"Mandelbulb without changing the window's Save target.")
 															.arg(info->internalName);
 
-	QJsonArray parameters;
 	cParameterContainer *slot = gParFractal->at(0).get();
+	const QString lowered = info->internalName.toLower();
+	const bool box = lowered.contains("mandelbox") || lowered.contains("abox") || lowered.contains("boxfold");
+	const bool ifs = lowered.contains("ifs") || lowered.contains("kaleido");
+	const bool klein = lowered.contains("klein");
+	const bool sponge = lowered.contains("menger") || lowered.contains("sponge") || lowered.contains("sierpinski");
+	struct sStart
+	{
+		const char *name;
+		const char *why;
+	};
+	QVector<sStart> starts;
+	if (box)
+	{
+		starts = {{"mandelbox_scale",
+								 "Size of the box. -1.5 is the Amazing Box. The stored 2 puts the default camera inside."},
+			{"mandelbox_folding_limit", "Leave this at the default until scale -1.5 is on screen."},
+			{"formula_iterations", "How many times this formula repeats. 1 is one pass."}};
+	}
+	else if (ifs)
+	{
+		starts = {{"IFS_scale", "Size of the IFS. 2 is a usual crystal. This is not formula_scale."},
+			{"IFS_offset", "Shift applied on each fold. [1, 1, 1] is a common start."},
+			{"IFS_abs_x", "Mirror across x."},
+			{"IFS_abs_y", "Mirror across y."},
+			{"IFS_abs_z", "Mirror across z."}};
+	}
+	else if (klein)
+	{
+		starts = {{"transf_scale",
+								 "Scale of the Kleinian transform. Leave the default, then put the camera a few units from the origin. frame_scene will not fly out to the bailout sphere."},
+			{"formula_iterations", "How many times this formula repeats. Start at the default."}};
+	}
+	else if (sponge)
+	{
+		starts = {{"formula_iterations", "How many times the sponge is folded. Higher is more porous and slower."}};
+	}
+	else
+	{
+		starts = {{"power",
+								 "Exponent. 8 is the classic Mandelbulb. This is not the Mandelbox size; that is mandelbox_scale."},
+			{"formula_iterations", "How many times this formula repeats. 1 is one pass."},
+			{"bailout", "Escape radius. Leave use_default_bailout on unless you are matching a published set."}};
+	}
+	QJsonArray startHere;
+	auto addStart = [&](const QString &paramName, const QString &why) {
+		if (!slot->IfExists(paramName) || startHere.size() >= 6) return;
+		for (const QJsonValue &existing : startHere)
+		{
+			if (existing.toObject().value("name").toString() == paramName) return;
+		}
+		QJsonObject item;
+		item["name"] = paramName;
+		item["why"] = why;
+		const QJsonObject record = ParameterRecord(slot, paramName);
+		if (paramName == QLatin1String("mandelbox_scale"))
+			item["known_good"] = -1.5;
+		else if (paramName == QLatin1String("power"))
+			item["known_good"] = 8;
+		else if (paramName == QLatin1String("IFS_scale"))
+			item["known_good"] = 2.0;
+		else if (paramName == QLatin1String("IFS_offset"))
+			item["known_good"] = QJsonArray{1.0, 1.0, 1.0};
+		else if (paramName.startsWith(QLatin1String("IFS_abs_")))
+			item["known_good"] = true;
+		else if (record.contains("default"))
+			item["known_good"] = record.value("default");
+		if (record.contains("type")) item["type"] = record.value("type");
+		startHere.append(item);
+	};
+	for (const sStart &start : starts)
+		addStart(QString::fromLatin1(start.name), QString::fromLatin1(start.why));
+	if (startHere.size() < 3)
+	{
+		for (const sUiParam &uiParam : info->parameters)
+		{
+			const QString why = uiParam.description.isEmpty()
+														? QString("One of the controls this formula shows.")
+														: uiParam.description.left(180);
+			addStart(uiParam.name, why);
+			if (startHere.size() >= 4) break;
+		}
+	}
+	object["start_here"] = startHere;
+	object["parameter_count"] = int(info->parameters.size());
+	if (!verbose)
+	{
+		object["parameters_note"] =
+			"start_here is the short list. Pass verbose true for every control this formula shows.";
+		return object;
+	}
+
+	QJsonArray parameters;
 	for (const sUiParam &uiParam : info->parameters)
 	{
 		QJsonObject record = ParameterRecord(slot, uiParam.name);
@@ -884,32 +1018,106 @@ QJsonObject DescribeFormula(const QString &name, QString *error)
 		record["note"] =
 			"Shared by every formula slot. Set it with set_parameters and fractal_slot. It is not "
 			"unique to this formula, but it is usually what you change next.";
+		if (commonName == QLatin1String("power"))
+		{
+			record["description"] =
+				"Exponent for power-family formulas such as Mandelbulb. It is not the Mandelbox size. "
+				"That control is mandelbox_scale, and -1.5 is the Amazing Box.";
+		}
 		common.append(record);
 	}
 	object["common_slot_parameters"] = common;
 	return object;
 }
 
-QJsonArray ListExamples(const QString &query, int limit)
+QString ExampleCollection(const QString &relative)
+{
+	const int slash = relative.indexOf('/');
+	if (slash < 0) return QString("examples");
+	return relative.left(slash);
+}
+
+QJsonArray ExampleCollections()
+{
+	const QString root = systemDirectories.sharedDir + "examples";
+	QMap<QString, int> counts;
+	QDirIterator files(root, QStringList() << "*.fract", QDir::Files, QDirIterator::Subdirectories);
+	while (files.hasNext())
+	{
+		const QString relative = QDir(root).relativeFilePath(files.next());
+		counts[ExampleCollection(relative)]++;
+	}
+	QJsonArray collections;
+	for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
+	{
+		QJsonObject object;
+		object["name"] = it.key();
+		object["count"] = it.value();
+		collections.append(object);
+	}
+	return collections;
+}
+
+QJsonArray ListExamples(const QString &query, int limit, const QString &collection)
 {
 	if (limit <= 0) limit = 20;
 	if (limit > 50) limit = 50;
 	const QString root = systemDirectories.sharedDir + "examples";
 	const QString needle = query.trimmed().toLower();
-	QJsonArray array;
+	const QString wanted = collection.trimmed();
+	struct sExample
+	{
+		QString name;
+		QString path;
+		QString collection;
+	};
+	QMap<QString, QVector<sExample>> groups;
 	QDirIterator files(root, QStringList() << "*.fract", QDir::Files, QDirIterator::Subdirectories);
 	while (files.hasNext())
 	{
 		const QString full = files.next();
 		const QString relative = QDir(root).relativeFilePath(full);
+		const QString group = ExampleCollection(relative);
+		if (!wanted.isEmpty() && group.compare(wanted, Qt::CaseInsensitive) != 0) continue;
 		if (!needle.isEmpty() && !relative.toLower().contains(needle)
 			&& !QFileInfo(full).fileName().toLower().contains(needle))
 			continue;
-		QJsonObject object;
-		object["name"] = QFileInfo(full).fileName();
-		object["path"] = relative;
-		array.append(object);
-		if (array.size() >= limit) break;
+		groups[group].append(sExample{QFileInfo(full).fileName(), relative, group});
+	}
+	QJsonArray array;
+	if (!needle.isEmpty())
+	{
+		for (auto it = groups.constBegin(); it != groups.constEnd(); ++it)
+		{
+			for (const sExample &example : it.value())
+			{
+				QJsonObject object;
+				object["name"] = example.name;
+				object["path"] = example.path;
+				object["collection"] = example.collection;
+				array.append(object);
+				if (array.size() >= limit) return array;
+			}
+		}
+		return array;
+	}
+	// A short sample from each collection, then a second pass if the limit allows.
+	bool more = true;
+	for (int round = 0; more && array.size() < limit && round < 3; round++)
+	{
+		more = false;
+		for (auto it = groups.constBegin(); it != groups.constEnd(); ++it)
+		{
+			if (round >= it.value().size()) continue;
+			more = true;
+			const sExample &example = it.value().at(round);
+			QJsonObject object;
+			object["name"] = example.name;
+			object["path"] = example.path;
+			object["collection"] = example.collection;
+			array.append(object);
+			if (array.size() >= limit) break;
+		}
 	}
 	return array;
 }
@@ -1001,12 +1209,30 @@ QJsonArray ListParameters(const QString &area, int fractalSlot, const QString &q
 		return QJsonArray();
 	}
 
-	QJsonArray array;
+	struct sHit
+	{
+		int rank = 0;
+		int order = 0;
+		QJsonObject record;
+	};
+	QVector<sHit> hits;
+	int order = 0;
 	auto consider = [&](cParameterContainer *container, const QString &name, const QString &where) {
-		if (array.size() >= limit) return;
-		if (!needle.isEmpty() && !name.toLower().contains(needle)
-			&& !Glossary(name).toLower().contains(needle) && !TooltipFor(name).toLower().contains(needle))
-			return;
+		int rank = 0;
+		if (!needle.isEmpty())
+		{
+			const QString lowered = name.toLower();
+			if (lowered == needle)
+				rank = 0;
+			else if (lowered.startsWith(needle))
+				rank = 1;
+			else if (lowered.contains(needle))
+				rank = 2;
+			else if (Glossary(name).toLower().contains(needle) || TooltipFor(name).toLower().contains(needle))
+				rank = 3;
+			else
+				return;
+		}
 		if (!wanted.isEmpty() && wanted != "all" && wanted != "fractal")
 		{
 			if (AreaOf(name) != wanted) return;
@@ -1021,7 +1247,20 @@ QJsonArray ListParameters(const QString &area, int fractalSlot, const QString &q
 				&& !name.contains("name"))
 				return;
 		}
-		array.append(record);
+		hits.append(sHit{rank, order++, record});
+	};
+	auto take = [&]() {
+		std::sort(hits.begin(), hits.end(), [](const sHit &a, const sHit &b) {
+			if (a.rank != b.rank) return a.rank < b.rank;
+			return a.order < b.order;
+		});
+		QJsonArray array;
+		for (const sHit &hit : hits)
+		{
+			array.append(hit.record);
+			if (array.size() >= limit) break;
+		}
+		return array;
 	};
 
 	if (wanted == "fractal" || wanted.isEmpty())
@@ -1048,13 +1287,13 @@ QJsonArray ListParameters(const QString &area, int fractalSlot, const QString &q
 			"use_default_bailout", "julia_mode", "julia_c"};
 		for (const QString &commonName : commonNames)
 			consider(slot, commonName, QString("fractal_slot_%1").arg(fractalSlot));
-		if (wanted == "fractal") return array;
+		if (wanted == "fractal") return take();
 	}
 
 	const QList<QString> names = gPar->GetListOfParameters();
 	for (const QString &name : names)
 		consider(gPar.get(), name, "main");
-	return array;
+	return take();
 }
 
 } // namespace mcpCatalog
