@@ -68,6 +68,8 @@ public:
 	int GetProgressivePass() const { return progressivePass; }
 	bool ProgressiveNextStep();
 	QList<int> CreateDoneList() const;
+	// Finished lines, safe to read while workers are still rendering other lines.
+	QList<int> SnapshotDoneLines();
 	bool IsLineDoneByServer(int line) const;
 
 private:

@@ -54,4 +54,12 @@ private:
 
 extern cMcpServer *gMcpServer;
 
+// MCP renders use one core under the machine limit, at the lowest priority,
+// until set_parameters writes either value. That default is not stored in the
+// application settings.
+void McpMarkThreadSettingsOverridden();
+int McpEffectiveThreadCount();
+int McpEffectiveThreadPriority();
+void ApplyMcpRenderThreads();
+
 #endif /* MANDELBULBER2_SRC_MCP_SERVER_H_ */

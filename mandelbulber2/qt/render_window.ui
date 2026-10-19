@@ -515,6 +515,7 @@
     <addaction name="actionShow_gamepad_dock"/>
     <addaction name="actionShow_queue_dock"/>
     <addaction name="actionShow_measurement_dock"/>
+    <addaction name="actionShow_background_renders_dock"/>
     <addaction name="separator"/>
    </widget>
    <widget class="QMenu" name="menuAbout">
@@ -1072,6 +1073,15 @@
     </layout>
    </widget>
   </widget>
+  <widget class="QDockWidget" name="dockWidget_background_renders">
+   <property name="windowTitle">
+    <string>Background renders</string>
+   </property>
+   <attribute name="dockWidgetArea">
+    <number>2</number>
+   </attribute>
+   <widget class="cDockBackgroundRenders" name="widgetDockBackgroundRenders" native="true"/>
+  </widget>
   <widget class="QDockWidget" name="dockWidget_materialEditor">
    <property name="features">
     <set>QDockWidget::DockWidgetFloatable|QDockWidget::DockWidgetMovable</set>
@@ -1586,6 +1596,14 @@
     <string>Show &amp;measurement dock</string>
    </property>
   </action>
+  <action name="actionShow_background_renders_dock">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="text">
+    <string>Show &amp;background renders</string>
+   </property>
+  </action>
   <action name="actionExport_Mesh">
    <property name="icon">
     <iconset resource="icons.qrc">
@@ -1801,6 +1819,12 @@
    <class>cDockMeasurements</class>
    <extends>QWidget</extends>
    <header>dock_measurements.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>cDockBackgroundRenders</class>
+   <extends>QWidget</extends>
+   <header>dock_background_renders.h</header>
    <container>1</container>
   </customwidget>
   <customwidget>

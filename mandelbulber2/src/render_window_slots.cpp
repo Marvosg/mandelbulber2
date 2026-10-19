@@ -63,6 +63,15 @@
 #include "qt/thumbnail_widget.h"
 #include "qt/voxel_export_dialog.h"
 
+#include <algorithm>
+
+#include <QDateTime>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
+#include <QTimer>
+#include <QWidgetAction>
+
 void RenderWindow::slotResizedScrolledAreaImage(int width, int height) const
 {
 	if (gMainInterface->mainImage)
@@ -379,13 +388,123 @@ void RenderWindow::slotChangedCheckBoxCursorVisibility(int state)
 	gMainInterface->renderedImage->SetCursorVisibility(state);
 }
 
+QString RenderWindow::ToolbarPresetDirectory()
+{
+	if (gPar && gPar->IfExists("toolbar_path"))
+	{
+		const QString path = gPar->Get<QString>("toolbar_path");
+		if (!path.isEmpty()) return path;
+	}
+	return systemDirectories.GetToolbarFolder();
+}
+
+QString RenderWindow::AgentPresetDirectory()
+{
+	return QDir(ToolbarPresetDirectory()).filePath(QStringLiteral("agent"));
+}
+
+bool RenderWindow::PresetFileIsAgent(const QString &path)
+{
+	const QString agentRoot = QDir::cleanPath(AgentPresetDirectory());
+	const QString clean = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+	if (clean == agentRoot || clean.startsWith(agentRoot + QLatin1Char('/'))) return true;
+	QFile file(path);
+	if (!file.open(QIODevice::ReadOnly)) return false;
+	const QString head = QString::fromUtf8(file.read(800));
+	const QStringList lines = head.split(QLatin1Char('\n'));
+	return lines.size() >= 3 && lines.at(2).contains(QStringLiteral("agent preset"));
+}
+
+QStringList RenderWindow::OrderedPresetFiles()
+{
+	struct sItem
+	{
+		QString path;
+		QDateTime modified;
+	};
+	QList<sItem> user;
+	QList<sItem> agent;
+	auto take = [&](const QString &directory, bool forceAgent) {
+		QDir dir(directory);
+		const QStringList names = dir.entryList(QDir::Files);
+		for (const QString &name : names)
+		{
+			const QString path = dir.filePath(name);
+			if (QFileInfo(path).suffix().compare(QStringLiteral("fract"), Qt::CaseInsensitive) != 0)
+				continue;
+			sItem item{path, QFileInfo(path).lastModified()};
+			if (forceAgent || PresetFileIsAgent(path))
+				agent.append(item);
+			else
+				user.append(item);
+		}
+	};
+	take(ToolbarPresetDirectory(), false);
+	take(AgentPresetDirectory(), true);
+	const auto newer = [](const sItem &a, const sItem &b) { return a.modified > b.modified; };
+	std::sort(user.begin(), user.end(), newer);
+	std::sort(agent.begin(), agent.end(), newer);
+	QStringList paths;
+	for (const sItem &item : user)
+		paths.append(item.path);
+	for (const sItem &item : agent)
+		paths.append(item.path);
+	return paths;
+}
+
+bool RenderWindow::MarkAgentPresetFile(const QString &path)
+{
+	QFile file(path);
+	if (!file.open(QIODevice::ReadOnly)) return false;
+	const QString text = QString::fromUtf8(file.readAll());
+	file.close();
+	QStringList lines = text.split(QLatin1Char('\n'));
+	if (lines.size() < 3) return false;
+	if (!lines.at(2).contains(QStringLiteral("agent preset")))
+		lines[2] += QStringLiteral(" agent preset");
+	if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+	const QByteArray bytes = lines.join(QLatin1Char('\n')).toUtf8();
+	return file.write(bytes) == bytes.size();
+}
+
+QString RenderWindow::WaitForPresetThumbnail(const QString &filename, int timeoutMs)
+{
+	slotPopulateToolbar();
+	cThumbnailWidget *thumb = nullptr;
+	const QList<QAction *> actions = ui->toolBar->actions();
+	for (QAction *action : actions)
+	{
+		if (action->objectName() != filename) continue;
+		auto *widgetAction = qobject_cast<QWidgetAction *>(action);
+		if (!widgetAction || !widgetAction->defaultWidget()) continue;
+		thumb = widgetAction->defaultWidget()->findChild<cThumbnailWidget *>();
+		break;
+	}
+	if (!thumb) return QString();
+	auto cached = [thumb]() -> QString {
+		if (!thumb->IsRendered()) return QString();
+		const QString path = thumb->GetThumbnailFileName();
+		return QFileInfo::exists(path) ? path : QString();
+	};
+	const QString ready = cached();
+	if (!ready.isEmpty()) return ready;
+	thumb->DisableTimer();
+	QEventLoop loop;
+	QTimer timer;
+	timer.setSingleShot(true);
+	connect(thumb, &cThumbnailWidget::thumbnailRendered, &loop, &QEventLoop::quit);
+	connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+	timer.start(qMax(1, timeoutMs));
+	thumb->slotRender();
+	if (!thumb->IsRendered()) loop.exec();
+	return cached();
+}
+
 // adds dynamic actions to the toolbar (example settings)
 void RenderWindow::slotPopulateToolbar(bool completeRefresh)
 {
 	WriteLog("cInterface::PopulateToolbar(QWidget *window, QToolBar *toolBar) started", 2);
-	QDir toolbarDir = QDir(gPar->Get<QString>("toolbar_path"));
-	toolbarDir.setSorting(QDir::Time);
-	QStringList toolbarFiles = toolbarDir.entryList(QDir::NoDotAndDotDot | QDir::Files);
+	const QStringList toolbarFiles = OrderedPresetFiles();
 	QSignalMapper *mapPresetsFromExamplesLoad = new QSignalMapper(this);
 	QSignalMapper *mapPresetsFromExamplesRemove = new QSignalMapper(this);
 	ui->toolBar->setIconSize(
@@ -425,7 +544,7 @@ void RenderWindow::slotPopulateToolbar(bool completeRefresh)
 			// already present
 			continue;
 		}
-		QString filename = gPar->Get<QString>("toolbar_path") + QDir::separator() + toolbarFiles.at(i);
+		const QString filename = toolbarFiles.at(i);
 		cThumbnailWidget *thumbWidget = nullptr;
 
 		if (QFileInfo(filename).suffix() == QString("fract"))

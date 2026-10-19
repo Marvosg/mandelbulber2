@@ -45,6 +45,7 @@
 #include "netrender.hpp"
 #include "post_effect_hdr_blur.h"
 #include "progress_text.hpp"
+#include "render_checkpoint.hpp"
 #include "render_data.hpp"
 #include "render_ssao.h"
 #include "render_worker.hpp"
@@ -141,6 +142,7 @@ void cRenderer::LaunchThreads(std::vector<QThread *> &threads,
 
 void cRenderer::TerminateRendering()
 {
+	renderCheckpoint::Save(image, scheduler.get());
 	scheduler->Stop();
 	image->CompileImage();
 	image->ConvertTo8bitChar();
@@ -373,6 +375,17 @@ bool cRenderer::RenderImage()
 		std::vector<cRenderWorker *> workers(data->configuration.GetNumberOfThreads());
 
 		scheduler.reset(new cScheduler(data->screenRegion, progressive));
+		const renderCheckpoint::sResume resume = renderCheckpoint::TakeResume();
+		if (resume.valid)
+		{
+			while (scheduler->GetProgressiveStep() > resume.progressiveStep)
+			{
+				if (!scheduler->ProgressiveNextStep()) break;
+			}
+			if (scheduler->GetProgressiveStep() == resume.progressiveStep)
+				scheduler->MarkReceivedLines(resume.lines);
+			emit updateImage();
+		}
 
 		InitializeThreadData(threadsData);
 
@@ -390,6 +403,8 @@ bool cRenderer::RenderImage()
 
 		QElapsedTimer pureRenderingTime;
 		pureRenderingTime.start();
+		QElapsedTimer checkpointTimer;
+		checkpointTimer.start();
 
 		WriteLog("Start rendering", 2);
 		do
@@ -409,6 +424,12 @@ bool cRenderer::RenderImage()
 				}
 
 				Wait(10); // wait 10ms
+
+				if (checkpointTimer.elapsed() > 5000)
+				{
+					renderCheckpoint::Save(image, scheduler.get());
+					checkpointTimer.restart();
+				}
 
 				if (data->configuration.UseRefreshRenderedList())
 				{
@@ -483,6 +504,10 @@ bool cRenderer::RenderImage()
 			}
 
 		} while (scheduler->ProgressiveNextStep());
+
+		// Stop already wrote the finished lines. A later pass would have cleared them.
+		if (!*data->stopRequest && !systemData.globalStopRequest)
+			renderCheckpoint::Save(image, scheduler.get());
 
 		// send last rendered lines
 		SendRenderedLinesToNetRenderAfterRendering(listToSend);

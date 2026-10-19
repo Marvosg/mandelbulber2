@@ -39,6 +39,7 @@
 #include <QtWidgets/QtWidgets>
 
 #include "algebra.hpp"
+#include "render_checkpoint.hpp"
 #include "camera_target.hpp"
 #include "primitives.h"
 #include "projection_3d.hpp"
@@ -99,6 +100,15 @@ public:
 	static void ComboMouseClickUpdate(
 		QComboBox *comboBox, std::shared_ptr<cParameterContainer> params);
 	bool AutoRecovery() const;
+	// True when a window render was scheduled and will use the viewport.
+	bool OfferRenderResume();
+	// Source named on the resume dialog while it is open. Empty otherwise.
+	QString OpenResumeDialogSource() const;
+	// Accepts or declines that dialog. False when it is not open for this source.
+	bool AnswerResumeDialog(const QString &source, bool accept);
+	// Loads the window checkpoint and starts it on the viewport.
+	bool StartWindowResume();
+	bool LoadWindowCheckpoint(const renderCheckpoint::sSummary &item);
 	bool DataFolderUpgrade() const;
 	void OptimizeStepFactor(double qualityTarget);
 	void ResetFormula(int fractalNumber) const;
@@ -131,6 +141,11 @@ public:
 	void LoadDefaultSettings();
 	bool CheckForMissingTextures();
 	static void UpdateCameraRotation(std::shared_ptr<cParameterContainer> params);
+	// Status-bar bar for a render the MCP socket started. The image on screen
+	// stays as it is; this only reports the background job.
+	void ShowBackgroundRenderProgress(
+		const QString &kind, const QString &progressText, double progress);
+	void HideBackgroundRenderProgress();
 
 	QSettings settings;
 
@@ -141,6 +156,7 @@ public:
 	PlayerWidget *imageSequencePlayer;
 	MyProgressBar *progressBar;
 	MyProgressBar *progressBarAnimation;
+	MyProgressBar *progressBarBackground;
 	QFrame *progressBarFrame;
 	QVBoxLayout *progressBarLayout;
 	std::shared_ptr<cImage> mainImage;

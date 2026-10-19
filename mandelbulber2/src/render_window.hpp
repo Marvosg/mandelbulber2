@@ -43,6 +43,7 @@
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QSettings>
+#include <QStringList>
 
 #include "files.h"
 #include "progress_text.hpp"
@@ -84,6 +85,8 @@ public:
 
 	QWidget *GetCentralWidget() const;
 	QComboBox *GetComboBoxMouseClickFunction() const;
+	// Puts the background-renders dock under Measurement.
+	void PlaceBackgroundRendersDock();
 
 protected:
 	bool eventFilter(QObject *obj, QEvent *event) override;
@@ -98,6 +101,16 @@ public slots:
 		double progress,
 		cProgressText::enumProgressType progressType = cProgressText::progress_IMAGE) const;
 	void slotPopulateToolbar(bool completeRefresh = false);
+	// Toolbar folder the preset list reads, and the agent subfolder beside the user's picks.
+	static QString ToolbarPresetDirectory();
+	static QString AgentPresetDirectory();
+	// True for a file in the agent folder or one whose header was marked when the agent saved it.
+	static bool PresetFileIsAgent(const QString &path);
+	// User presets, then agent presets. Each group is newest first.
+	static QStringList OrderedPresetFiles();
+	static bool MarkAgentPresetFile(const QString &path);
+	// Empty until that preset's toolbar thumbnail has finished.
+	QString WaitForPresetThumbnail(const QString &filename, int timeoutMs);
 	void slotPopulateCustomWindowStates(bool completeRefresh = false);
 	void slotQuestionMessage(const QString &questionTitle, const QString &questionText,
 		QMessageBox::StandardButtons buttons, QMessageBox::StandardButton *reply) const;

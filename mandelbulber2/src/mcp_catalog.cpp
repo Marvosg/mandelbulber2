@@ -358,8 +358,12 @@ const QHash<QString, QString> &GlossaryMap()
 			"Maximum iterations for the whole ray. This is a quality/depth limit, not the Mandelbulb "
 			"power. Raising it lets rays travel deeper into the set and gets slower. Lowering it "
 			"changes the shape, so do not cut it just to speed up a preview."},
-		{"image_width", "Final image width in pixels. A preview does not change this; it renders a small copy."},
-		{"image_height", "Final image height in pixels. Previews keep this aspect ratio."},
+		{"image_width",
+			"Final image width in pixels. A preview does not change this; it renders a small copy. An MCP "
+			"still clamps each side to 4096 and says so on the job."},
+		{"image_height",
+			"Final image height in pixels. Previews keep this aspect ratio. An MCP still clamps each side "
+			"to 4096."},
 		{"view_distance_max",
 			"How far a ray is allowed to travel. If the fractal is cut off in the distance, raise this."},
 		{"formula_iterations",
@@ -406,10 +410,41 @@ const QHash<QString, QString> &GlossaryMap()
 		{"ambient_occlusion_quality", "How many ambient-occlusion samples. Higher is smoother and slower."},
 		{"DOF_enabled",
 			"Depth of field blur. Expensive, and it hides the shape while you are still framing. Turn it "
-			"on only after the camera is right."},
+			"on only after the camera is right. Previews turn it off on a copy."},
+		{"DOF_focus",
+			"Distance from the eye, in fractal units, that stays sharp. Set it near camera_distance_to_target "
+			"so the subject is in focus and only nearer or farther surfaces blur."},
+		{"DOF_radius",
+			"How fast focus falls off. The blur scales with the image size, so the same value looks "
+			"similar at 800 px and at 4K. 10 is gentle. 20 and above softens most of a close view."},
 		{"volumetric_fog_enabled",
-			"Fog lit by the lights in the volume. Expensive. Different from iteration fog, which is a "
-			"cheap coloring of the orbit."},
+			"The effect the window calls 'Fog based on distance'. Density follows distance from the "
+			"fractal surface, not from the camera. A high density tints the air and looks underwater. "
+			"For a slight atmosphere use basic_fog_enabled instead. Previews turn this off on a copy."},
+		{"basic_fog_enabled",
+			"Haze that accumulates along the ray. This is the atmospheric one. It stays on during a "
+			"preview. Pair it with basic_fog_visibility and a color close to the background."},
+		{"basic_fog_visibility",
+			"Distance at which basic fog becomes opaque. Larger is thinner. For a slight haze, set this "
+			"to several times the camera distance so only the far side fades."},
+		{"basic_fog_color",
+			"Color of the basic haze. Match it to the background. A bright color turns the picture milky."},
+		{"antialiasing_enabled",
+			"Supersamples each output pixel on an n by n grid and averages the samples. This is the real "
+			"antialiasing. Leave it off while framing."},
+		{"antialiasing_size",
+			"The n in that n by n grid. 1 is one sample. 2 is 4 samples per pixel, which is 4x "
+			"supersampling, and render time scales by about n squared. detail_level is measured in "
+			"output pixels, so 4K with size 2 is much slower than 4 times a screen preview."},
+		{"limit_CPU_cores",
+			"How many CPU cores a render uses, from 1 up to the machine's logical core count. This is "
+			"an application setting, saved in the application ini, not in a .fract preset. An MCP "
+			"render uses one less than the count until set_parameters changes it. That default is not "
+			"written into the preference. An explicit change is, and quitting the app saves it."},
+		{"threads_priority",
+			"Render thread priority: 0 lowest, 1 low, 2 normal, 3 high. An application setting, not "
+			"part of a .fract preset. An MCP render uses 0 until set_parameters changes it. Low keeps "
+			"the machine responsive and does not cut heat the way limit_CPU_cores does."},
 		{"iteration_fog_enable",
 			"Colors the orbit trap as a fog. This is often the look of a Mandelbulber picture and it is "
 			"comparatively cheap. Do not turn it off just to speed a preview."},
@@ -737,6 +772,47 @@ QJsonArray ListFormulas(const QString &query, int limit)
 	return array;
 }
 
+QString WhereHint(const QString &internalName, fractal::enumDEType type, fractal::enumDEFunctionType function,
+	double *typicalRadius)
+{
+	const QString name = internalName.toLower();
+	const bool box = name.contains("mandelbox") || name.contains("abox") || name.contains("boxfold");
+	const bool bulb = !box && (name.contains("bulb") || name.contains("bristorbrot") || name.contains("buffalo"));
+	const bool sponge = name.contains("menger") || name.contains("sponge") || name.contains("sierpinski");
+	const bool ifs = function == fractal::pseudoKleinianDEFunction ? false
+		: (name.contains("ifs") || name.contains("kaleido"));
+	const bool klein = function == fractal::pseudoKleinianDEFunction || function == fractal::josKleinianDEFunction
+										 || name.contains("klein");
+	if (box)
+		return "A box fractal lives in a cube around the origin. Its size follows the scale, often "
+					 "mandelbox_scale. Scale 2, the usual stored default, puts the default camera inside the "
+					 "solid. Use about -1.5 to -2.5, or call frame_scene.";
+	if (bulb)
+	{
+		*typicalRadius = 1.2;
+		return "A bulb lives near the unit sphere. The detailed surface is about radius 1.2 from the origin. "
+					 "Frame that, then move toward an edge cell.";
+	}
+	if (sponge)
+	{
+		*typicalRadius = 1.0;
+		return "This shape lives in a cube or tetrahedron around the origin, about radius 1. The interesting "
+					 "places are the holes and the edges, not the empty space outside.";
+	}
+	if (ifs)
+		return "An IFS lives around the origin. formula_scale is the size. The interesting places are the "
+					 "folds, not the empty space outside. frame_scene if the picture is empty.";
+	if (klein)
+		return "A Kleinian lives in a cluster of spheres around the origin. Frame the cluster, then move "
+					 "toward a cusp, which shows up as an edge or ridge cell.";
+	if (type == fractal::analyticDEType)
+		return "The shape is the surface where the distance estimate reaches zero, usually within a few "
+					 "units of the origin. frame_scene if the picture is empty or the eye is inside. Ranked "
+					 "preview cells then show which part has a silhouette or a fold.";
+	return "This formula estimates distance numerically, so it has no closed-form size. The surface is "
+				 "where that estimate reaches zero. frame_scene if the picture is empty or the eye is inside.";
+}
+
 QJsonObject DescribeFormula(const QString &name, QString *error)
 {
 	sFormulaInfo *info = FindFormula(name);
@@ -755,6 +831,15 @@ QJsonObject DescribeFormula(const QString &name, QString *error)
 												: info->summary;
 	object["distance_estimation"] = info->distanceEstimation;
 	object["default_bailout"] = info->defaultBailout;
+	for (cAbstractFractal *formula : newFractalList)
+	{
+		if (QString::fromStdString(formula->getInternalName()) != info->internalName) continue;
+		double typicalRadius = 0.0;
+		object["where"] = WhereHint(info->internalName, formula->getDeType(), formula->getDeFunctionType(),
+			&typicalRadius);
+		if (typicalRadius > 0.0) object["typical_radius"] = typicalRadius;
+		break;
+	}
 	QJsonArray references;
 	for (const QString &reference : info->references)
 		references.append(reference);

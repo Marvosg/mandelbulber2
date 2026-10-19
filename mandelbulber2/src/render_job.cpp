@@ -45,6 +45,7 @@
 #include "fractparams.hpp"
 #include "global_data.hpp"
 #include "hybrid_fractal_sequences.h"
+#include "initparameters.hpp"
 #include "image_scale.hpp"
 #include "netrender.hpp"
 #include "objects_tree.h"
@@ -59,6 +60,7 @@
 #include "perlin_noise_octaves.h"
 #include "post_effect_hdr_blur.h"
 #include "progress_text.hpp"
+#include "render_checkpoint.hpp"
 #include "render_data.hpp"
 #include "render_image.hpp"
 #include "render_ssao.h"
@@ -218,9 +220,14 @@ bool cRenderJob::Init(enumMode _mode, const cRenderingConfiguration &config)
 		}
 	}
 
+	// Preferences and MCP both write these parameters. Read them here so a
+	// change applies to this render, not only after the preferences dialog.
+	if (gPar->IfExists("limit_CPU_cores"))
+		systemData.numberOfThreads = gPar->Get<int>("limit_CPU_cores");
+	if (gPar->IfExists("threads_priority"))
+		systemData.threadsPriority =
+			enumRenderingThreadPriority(gPar->Get<int>("threads_priority"));
 	totalNumberOfCPUs = systemData.numberOfThreads;
-	// totalNumberOfCPUs = 1;
-	// systemData.numberOfThreads = 1;
 
 	// aux renderer data
 	renderData.reset(new sRenderData);
@@ -502,7 +509,13 @@ bool cRenderJob::Execute()
 					ConnectNetRenderSignalsSlots(renderer.get());
 				}
 
+				const bool checkpoint = !checkpointSource.isEmpty() && !twoPassStereo
+																&& !renderData->configuration.UseNetRender();
+				if (checkpoint)
+					renderCheckpoint::Begin(checkpointSource, checkpointOutput, checkpointKind, image,
+						paramsContainer, fractalContainer);
 				result = renderer->RenderImage();
+				if (checkpoint && result) renderCheckpoint::OnImageDone();
 
 				if (twoPassStereo && repeat == 0) renderData->stereo.StoreImageInBuffer(image);
 			}

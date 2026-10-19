@@ -1117,12 +1117,14 @@ bool cFlightAnimation::RenderFlight(bool *stopRequest)
 			renderJob->UpdateParameters(params, fractalParams);
 			renderJob->renderContext =
 				QString("flight frame %1/%2").arg(index + 1).arg(frameRanges.totalFrames);
+			const QString filename = GetFlightFilename(index, gNetRender->IsClient());
+			if (!gNetRender->IsClient() && !gNetRender->IsServer())
+				renderJob->EnableCheckpoint(QString("window"), filename, QString("flight"));
 			const int result = renderJob->Execute();
 			if (!result) throw false;
 
 			// save frame
 			QStringList listOfSavedFiles;
-			const QString filename = GetFlightFilename(index, gNetRender->IsClient());
 			const ImageFileSave::enumImageFileType fileType =
 				ImageFileSave::enumImageFileType(params->Get<int>("flight_animation_image_type"));
 			listOfSavedFiles = SaveImage(filename, fileType, image, gMainInterface->mainWindow);

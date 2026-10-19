@@ -98,6 +98,14 @@ public:
 	// A stop that is already true survives Execute. The window still clears the
 	// flag, so the next GUI render after a stop is not stuck stopped.
 	void PreserveStopRequest() { preserveStopRequest = true; }
+	// source is "window" or "background". output is the still path without .png.
+	void EnableCheckpoint(const QString &source, const QString &output,
+		const QString &kind = QString("still"))
+	{
+		checkpointSource = source;
+		checkpointOutput = output;
+		checkpointKind = kind;
+	}
 
 public slots:
 	void slotExecute();
@@ -150,6 +158,9 @@ private:
 	bool *stopRequest;
 	bool preserveStopRequest;
 	bool canUseNetRender;
+	QString checkpointSource;
+	QString checkpointOutput;
+	QString checkpointKind;
 
 	static int id; // global identifier of actual rendering job
 	static int runningJobs;

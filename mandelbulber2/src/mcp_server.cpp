@@ -48,6 +48,7 @@
 #include "keyframes.hpp"
 #include "object_node_type.h"
 #include "render_job.hpp"
+#include "render_window.hpp"
 #include "rendering_configuration.hpp"
 #include "settings.hpp"
 #include "synchronize_interface.hpp"
@@ -60,6 +61,35 @@
 #include "formula/definition/all_fractal_list.hpp"
 
 cMcpServer *gMcpServer = nullptr;
+
+static bool gMcpThreadSettingsOverridden = false;
+
+void McpMarkThreadSettingsOverridden()
+{
+	gMcpThreadSettingsOverridden = true;
+}
+
+int McpEffectiveThreadCount()
+{
+	if (gMcpThreadSettingsOverridden && gPar && gPar->IfExists("limit_CPU_cores"))
+		return gPar->Get<int>("limit_CPU_cores");
+	return qMax(1, get_cpu_count() - 1);
+}
+
+int McpEffectiveThreadPriority()
+{
+	if (gMcpThreadSettingsOverridden && gPar && gPar->IfExists("threads_priority"))
+		return gPar->Get<int>("threads_priority");
+	return int(renderingPriorityLowest);
+}
+
+void ApplyMcpRenderThreads()
+{
+	if (gMcpThreadSettingsOverridden) return;
+	const int running = qMax(1, mcpScene::RunningJobCount());
+	systemData.numberOfThreads = qMax(1, McpEffectiveThreadCount() / running);
+	systemData.threadsPriority = enumRenderingThreadPriority(McpEffectiveThreadPriority());
+}
 
 namespace
 {
@@ -228,31 +258,48 @@ bool ParseVector(const QJsonValue &value, int count, QVector<double> *out, QStri
 
 bool ParseColor(const QJsonValue &value, sRGB *out, QString *error)
 {
+	const QString rejected =
+		"Colors are #rrggbb or [r, g, b]. Components are 0 to 255, or 0 to 65535.";
 	if (value.isString())
 	{
-		QString text = value.toString().trimmed();
-		if (text.startsWith('#'))
+		const QString text = value.toString().trimmed();
+		if (text.size() != 7 || !text.startsWith('#'))
 		{
-			text = text.mid(1);
-			if (text.size() != 6)
-			{
-				*error = "Color strings look like #rrggbb.";
-				return false;
-			}
-			bool ok = false;
-			const int rgb = text.toInt(&ok, 16);
-			if (!ok)
-			{
-				*error = "Could not parse that color.";
-				return false;
-			}
-			*out = sRGB(((rgb >> 16) & 255) * 257, ((rgb >> 8) & 255) * 257, (rgb & 255) * 257);
-			return true;
+			*error = rejected;
+			return false;
+		}
+		bool ok = false;
+		const int rgb = text.mid(1).toInt(&ok, 16);
+		if (!ok)
+		{
+			*error = rejected;
+			return false;
+		}
+		*out = sRGB(((rgb >> 16) & 255) * 257, ((rgb >> 8) & 255) * 257, (rgb & 255) * 257);
+		return true;
+	}
+	if (!value.isArray() || value.toArray().size() != 3)
+	{
+		*error = rejected;
+		return false;
+	}
+	double channels[3];
+	const QJsonArray array = value.toArray();
+	for (int i = 0; i < 3; i++)
+	{
+		if (!array.at(i).isDouble())
+		{
+			*error = rejected;
+			return false;
+		}
+		channels[i] = array.at(i).toDouble();
+		if (channels[i] < 0.0 || channels[i] > 65535.0)
+		{
+			*error = rejected;
+			return false;
 		}
 	}
-	QVector<double> channels;
-	if (!ParseVector(value, 3, &channels, error)) return false;
-	const bool eightBit = channels[0] <= 255 && channels[1] <= 255 && channels[2] <= 255;
+	const bool eightBit = channels[0] <= 255.0 && channels[1] <= 255.0 && channels[2] <= 255.0;
 	auto channel = [&](double component) -> int {
 		const double scaled = eightBit ? component * 257.0 : component;
 		return qBound(0, int(qRound(scaled)), 65535);
@@ -399,6 +446,253 @@ QString FormulaNameFor(int formulaId)
 	return QString::number(formulaId);
 }
 
+QString PresetDisplayName(const QString &path)
+{
+	return QFileInfo(path).completeBaseName();
+}
+
+QString SanitizePresetName(const QString &raw, QString *error)
+{
+	QString name = raw.trimmed();
+	if (name.endsWith(QStringLiteral(".fract"), Qt::CaseInsensitive)) name.chop(6);
+	name = name.trimmed();
+	if (name.isEmpty())
+	{
+		*error = "name is the preset title, without a directory.";
+		return QString();
+	}
+	if (name.size() > 80)
+	{
+		*error = "name must be 80 characters or fewer.";
+		return QString();
+	}
+	const QRegularExpression bad(QStringLiteral("[^A-Za-z0-9 _.-]"));
+	if (name.contains(bad) || name.contains(QStringLiteral("..")) || name.startsWith(QLatin1Char('.')))
+	{
+		*error = "name may use letters, numbers, spaces, dots, dashes, and underscores.";
+		return QString();
+	}
+	return name;
+}
+
+bool LoadPresetContainers(const QString &path, std::shared_ptr<cParameterContainer> *parOut,
+	std::shared_ptr<cFractalContainer> *fractOut, QString *error)
+{
+	cSettings settings(cSettings::formatFullText);
+	settings.BeQuiet(true);
+	if (!settings.LoadFromFile(path))
+	{
+		*error = QString("Could not read %1.").arg(path);
+		return false;
+	}
+	auto par = std::make_shared<cParameterContainer>();
+	auto fractal = std::make_shared<cFractalContainer>();
+	par->SetContainerName(QStringLiteral("main"));
+	for (int j = 0; j < fractal->size(); j++)
+		fractal->at(j)->SetContainerName(QStringLiteral("fractal") + QString::number(j));
+	InitParams(par);
+	InitNodeParams(1, par);
+	for (int j = 0; j < fractal->size(); j++)
+		InitFractalParams(fractal->at(j));
+	InitMaterialParams(1, par);
+	if (!settings.Decode(par, fractal))
+	{
+		*error = QString("Could not read settings from %1.").arg(path);
+		return false;
+	}
+	*parOut = par;
+	*fractOut = fractal;
+	return true;
+}
+
+QJsonArray PresetFormulas(const cFractalContainer &fractal)
+{
+	QJsonArray formulas;
+	for (int i = 0; i < fractal.size(); i++)
+	{
+		const int formulaId = fractal.at(i)->Get<int>("formula");
+		if (formulaId == int(fractal::none)) continue;
+		QJsonObject slot;
+		slot["slot"] = i + 1;
+		slot["formula"] = FormulaNameFor(formulaId);
+		if (fractal.at(i)->IfExists("formula_iterations"))
+			slot["formula_iterations"] = fractal.at(i)->Get<int>("formula_iterations");
+		formulas.append(slot);
+	}
+	return formulas;
+}
+
+QJsonObject PresetRecord(const QString &path, bool withDetail)
+{
+	QJsonObject record;
+	record["name"] = PresetDisplayName(path);
+	record["file"] = path;
+	record["agent"] = RenderWindow::PresetFileIsAgent(path);
+	QString error;
+	std::shared_ptr<cParameterContainer> par;
+	std::shared_ptr<cFractalContainer> fractal;
+	if (!LoadPresetContainers(path, &par, &fractal, &error))
+	{
+		record["error"] = error;
+		return record;
+	}
+	record["formulas"] = PresetFormulas(*fractal);
+	if (!withDetail) return record;
+	record["detail_level"] = par->Get<double>("detail_level");
+	record["image_width"] = par->Get<int>("image_width");
+	record["image_height"] = par->Get<int>("image_height");
+	record["camera"] = mcpCatalog::ParameterRecord(par.get(), "camera").value("value");
+	record["target"] = mcpCatalog::ParameterRecord(par.get(), "target").value("value");
+	record["fov"] = par->Get<double>("fov");
+	return record;
+}
+
+QList<QString> MatchPresets(const QString &query, QString *error)
+{
+	const QString needle = query.trimmed();
+	if (needle.isEmpty())
+	{
+		*error = "Pass the preset name from list_presets.";
+		return {};
+	}
+	QString stem = needle;
+	if (stem.endsWith(QStringLiteral(".fract"), Qt::CaseInsensitive)) stem.chop(6);
+	QList<QString> matches;
+	const QStringList files = RenderWindow::OrderedPresetFiles();
+	for (const QString &path : files)
+	{
+		const QString name = PresetDisplayName(path);
+		const QString fileName = QFileInfo(path).fileName();
+		if (name.compare(needle, Qt::CaseInsensitive) == 0
+				|| name.compare(stem, Qt::CaseInsensitive) == 0
+				|| fileName.compare(needle, Qt::CaseInsensitive) == 0
+				|| path.compare(needle, Qt::CaseInsensitive) == 0)
+			matches.append(path);
+	}
+	if (matches.isEmpty())
+		*error = QString("No preset named '%1'. list_presets shows the names.").arg(needle);
+	else if (matches.size() > 1)
+	{
+		QStringList names;
+		for (const QString &path : matches)
+			names << QString("%1 (%2)").arg(PresetDisplayName(path), path);
+		*error = QString("More than one preset matches. Ask which one: %1").arg(names.join("; "));
+		matches.clear();
+	}
+	return matches;
+}
+
+void RefreshPresetStrip()
+{
+	if (systemData.noGui) return;
+	if (!gMainInterface || !gMainInterface->mainWindow) return;
+	gMainInterface->mainWindow->slotPopulateToolbar();
+}
+
+QJsonObject ListPresets()
+{
+	QJsonArray user;
+	QJsonArray agent;
+	const QStringList files = RenderWindow::OrderedPresetFiles();
+	for (const QString &path : files)
+	{
+		const QJsonObject record = PresetRecord(path, false);
+		if (record.value("agent").toBool())
+			agent.append(record);
+		else
+			user.append(record);
+	}
+	QJsonObject result;
+	result["user"] = user;
+	result["agent"] = agent;
+	result["note"] =
+		"user is the toolbar the person picked. agent presets were saved by this bridge. They sit to "
+		"the right of a separator. delete_preset can remove those and no others. inspect_preset adds "
+		"the thumbnail.";
+	return result;
+}
+
+QJsonObject InspectPreset(const QJsonObject &params)
+{
+	QString error;
+	const QList<QString> matches = MatchPresets(params.value("name").toString(), &error);
+	if (!error.isEmpty()) return Fail(error);
+	const QString path = matches.first();
+	RefreshPresetStrip();
+	QJsonObject result = PresetRecord(path, true);
+	if (!systemData.noGui && gMainInterface && gMainInterface->mainWindow)
+	{
+		const QString thumb = gMainInterface->mainWindow->WaitForPresetThumbnail(path, 45000);
+		if (!thumb.isEmpty())
+			result["thumbnail_path"] = thumb;
+		else
+			result["thumbnail_pending"] = true;
+	}
+	else
+		result["thumbnail_pending"] = true;
+	if (result.contains("thumbnail_path"))
+	{
+		result["note"] =
+			"formulas are the slots stored in the preset. The image is the toolbar thumbnail.";
+	}
+	else if (systemData.noGui)
+		result["note"] = "This session has no preset strip, so there is no thumbnail.";
+	else
+		result["note"] = "The thumbnail is still rendering. Call inspect_preset again.";
+	return result;
+}
+
+QJsonObject SavePreset(const QJsonObject &params)
+{
+	QString error;
+	const QString name = SanitizePresetName(params.value("name").toString(), &error);
+	if (!error.isEmpty()) return Fail(error);
+	const QString directory = RenderWindow::AgentPresetDirectory();
+	QDir().mkpath(directory);
+	const QString path = QDir(directory).filePath(name + QStringLiteral(".fract"));
+	if (QFileInfo::exists(path) && !params.value("overwrite").toBool(false))
+	{
+		return Fail("An agent preset with that name already exists. Pass overwrite true only when "
+								"replacing it was requested.");
+	}
+	if (!systemData.noGui && gMainInterface)
+		gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	cSettings settings(cSettings::formatCondensedText);
+	settings.CreateText(gPar, gParFractal, gAnimFrames, gKeyframes);
+	if (!settings.SaveToFile(path)) return Fail(QString("Could not write %1.").arg(path));
+	if (!RenderWindow::MarkAgentPresetFile(path))
+		return Fail(QString("Wrote %1 but could not mark it as an agent preset.").arg(path));
+	RefreshPresetStrip();
+	QJsonObject result;
+	result["saved"] = path;
+	result["name"] = name;
+	result["agent"] = true;
+	result["note"] =
+		"Saved on the agent side of the preset strip, after the separator. The live session is "
+		"unchanged. delete_preset can remove this file. It will not remove a preset the user added.";
+	return result;
+}
+
+QJsonObject DeletePreset(const QJsonObject &params)
+{
+	QString error;
+	const QList<QString> matches = MatchPresets(params.value("name").toString(), &error);
+	if (!error.isEmpty()) return Fail(error);
+	const QString path = matches.first();
+	if (!RenderWindow::PresetFileIsAgent(path))
+	{
+		return Fail(
+			"That preset belongs to the user. delete_preset only removes presets this agent saved.");
+	}
+	if (!QFile::remove(path)) return Fail(QString("Could not remove %1.").arg(path));
+	RefreshPresetStrip();
+	QJsonObject result;
+	result["deleted"] = path;
+	result["name"] = PresetDisplayName(path);
+	result["note"] = "Removed from the agent side of the preset strip. The live session is unchanged.";
+	return result;
+}
+
 bool LoadFractFile(const QString &path, QString *error)
 {
 	cSettings settings(cSettings::formatFullText);
@@ -436,12 +730,26 @@ QJsonObject StateSummary()
 	summary["image_width"] = gPar->Get<int>("image_width");
 	summary["image_height"] = gPar->Get<int>("image_height");
 	QJsonObject effects;
-	const QStringList flags = {"ambient_occlusion_enabled", "DOF_enabled", "volumetric_fog_enabled",
-		"iteration_fog_enable", "glow_enabled", "raytraced_reflections", "DOF_MC_global_illumination"};
+	const QStringList flags = {"ambient_occlusion_enabled", "DOF_enabled", "basic_fog_enabled",
+		"volumetric_fog_enabled", "iteration_fog_enable", "glow_enabled", "raytraced_reflections",
+		"DOF_MC_global_illumination", "antialiasing_enabled"};
 	for (const QString &flag : flags)
 	{
 		if (gPar->IfExists(flag)) effects[flag] = gPar->Get<bool>(flag);
 	}
+	if (gPar->IfExists("DOF_focus")) effects["DOF_focus"] = gPar->Get<double>("DOF_focus");
+	if (gPar->IfExists("DOF_radius")) effects["DOF_radius"] = gPar->Get<double>("DOF_radius");
+	if (gPar->IfExists("basic_fog_visibility"))
+		effects["basic_fog_visibility"] = gPar->Get<double>("basic_fog_visibility");
+	if (gPar->IfExists("antialiasing_size"))
+		effects["antialiasing_size"] = gPar->Get<int>("antialiasing_size");
+	if (gPar->IfExists("limit_CPU_cores"))
+		effects["limit_CPU_cores"] = gPar->Get<int>("limit_CPU_cores");
+	if (gPar->IfExists("threads_priority"))
+		effects["threads_priority"] = gPar->Get<int>("threads_priority");
+	effects["mcp_render_threads"] = McpEffectiveThreadCount();
+	effects["mcp_threads_priority"] = McpEffectiveThreadPriority();
+	effects["live_render_threads"] = systemData.numberOfThreads;
 	summary["effects"] = effects;
 	summary["loaded_file"] = systemData.lastSettingsFile;
 	summary["note"] =
@@ -475,6 +783,87 @@ QJsonObject ChangedParameters(int limit)
 	object["changed"] = changed;
 	object["truncated"] = hidden;
 	return object;
+}
+
+QString FactText(const QJsonValue &value)
+{
+	if (value.isBool()) return value.toBool() ? QString("on") : QString("off");
+	if (value.isString()) return value.toString();
+	if (value.isDouble()) return QString::number(value.toDouble(), 'g', 8);
+	if (value.isArray())
+	{
+		QStringList parts;
+		for (const QJsonValue &item : value.toArray())
+			parts << FactText(item);
+		return QString("[%1]").arg(parts.join(", "));
+	}
+	return QString();
+}
+
+void PutFact(QJsonObject *facts, const QString &key, cParameterContainer *container, const QString &name,
+	const QString &which)
+{
+	const QJsonObject record = mcpCatalog::ParameterRecord(container, name);
+	const QJsonValue value = record.value(which);
+	if (!value.isUndefined() && !value.isNull()) (*facts)[key] = FactText(value);
+}
+
+void PutRange(QJsonObject *facts, const QString &prefix, cParameterContainer *container, const QString &name)
+{
+	PutFact(facts, prefix + "_min", container, name, "minimum");
+	PutFact(facts, prefix + "_max", container, name, "maximum");
+}
+
+QJsonObject ProgramFacts()
+{
+	QJsonObject facts;
+	PutFact(&facts, "camera_default", gPar.get(), "camera", "default");
+	PutFact(&facts, "camera_value", gPar.get(), "camera", "value");
+	PutFact(&facts, "target_default", gPar.get(), "target", "default");
+	PutFact(&facts, "target_value", gPar.get(), "target", "value");
+	PutFact(&facts, "fov_default", gPar.get(), "fov", "default");
+	PutFact(&facts, "fov_value", gPar.get(), "fov", "value");
+	PutRange(&facts, "fov", gPar.get(), "fov");
+	PutFact(&facts, "distance_value", gPar.get(), "camera_distance_to_target", "value");
+	PutFact(&facts, "detail_default", gPar.get(), "detail_level", "default");
+	PutRange(&facts, "detail", gPar.get(), "detail_level");
+	PutFact(&facts, "de_default", gPar.get(), "DE_factor", "default");
+	PutRange(&facts, "de", gPar.get(), "DE_factor");
+	PutFact(&facts, "n_default", gPar.get(), "N", "default");
+	PutRange(&facts, "n", gPar.get(), "N");
+	PutFact(&facts, "frames_per_keyframe_default", gPar.get(), "frames_per_keyframe", "default");
+	PutRange(&facts, "frames_per_keyframe", gPar.get(), "frames_per_keyframe");
+	PutFact(&facts, "dof_focus_default", gPar.get(), "DOF_focus", "default");
+	PutRange(&facts, "dof_focus", gPar.get(), "DOF_focus");
+	PutFact(&facts, "dof_radius_default", gPar.get(), "DOF_radius", "default");
+	PutRange(&facts, "dof_radius", gPar.get(), "DOF_radius");
+	PutFact(&facts, "fog_visibility_default", gPar.get(), "basic_fog_visibility", "default");
+	PutRange(&facts, "fog_visibility", gPar.get(), "basic_fog_visibility");
+	PutFact(&facts, "glow_default", gPar.get(), "glow_enabled", "default");
+	PutFact(&facts, "aa_size_default", gPar.get(), "antialiasing_size", "default");
+	PutFact(&facts, "aa_size_value", gPar.get(), "antialiasing_size", "value");
+	PutRange(&facts, "aa_size", gPar.get(), "antialiasing_size");
+	facts["cpu_cores"] = QString::number(McpEffectiveThreadCount());
+	PutFact(&facts, "cpu_saved", gPar.get(), "limit_CPU_cores", "value");
+	PutRange(&facts, "cpu", gPar.get(), "limit_CPU_cores");
+	facts["thread_priority"] = QString::number(McpEffectiveThreadPriority());
+	PutFact(&facts, "thread_priority_saved", gPar.get(), "threads_priority", "value");
+	PutRange(&facts, "thread_priority", gPar.get(), "threads_priority");
+	if (gParFractal && gParFractal->size() > 0)
+	{
+		cParameterContainer *slot = gParFractal->at(0).get();
+		PutFact(&facts, "power_default", slot, "power", "default");
+		PutRange(&facts, "power", slot, "power");
+		PutFact(&facts, "mandelbox_scale_default", slot, "mandelbox_scale", "default");
+		PutFact(&facts, "formula_iterations_default", slot, "formula_iterations", "default");
+		PutRange(&facts, "formula_iterations", slot, "formula_iterations");
+	}
+	if (gPar->IfExists("mat1_surface_color_gradient"))
+		PutFact(&facts, "gradient_default", gPar.get(), "mat1_surface_color_gradient", "default");
+	facts["still_cap"] = QString::number(4096);
+	facts["draft_cap"] = QString::number(640);
+	facts["wait_minutes"] = QString::number(3);
+	return facts;
 }
 } // namespace
 
@@ -666,9 +1055,12 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 {
 	if (mcpScene::JobActive())
 	{
-		const QStringList allowed = {"get_session", "get_state", "list_formulas", "describe_formula",
-			"list_parameters", "describe_parameter", "list_examples", "get_objects_tree", "get_animation",
-			"get_image", "get_contact_sheet", "render_status", "stop_render"};
+		const QStringList allowed = {"get_session", "get_state", "program_facts", "list_formulas",
+			"describe_formula", "list_parameters", "describe_parameter", "list_examples",
+			"get_objects_tree", "get_animation", "get_image", "get_contact_sheet", "probe_view",
+			"look_around", "measure_view", "render_preview", "render_still", "render_animation",
+			"render_status", "stop_render", "list_presets", "inspect_preset", "save_preset",
+			"delete_preset"};
 		if (!allowed.contains(method))
 		{
 			return Fail("A render is already running. Poll render_status or get_image, or call "
@@ -691,9 +1083,17 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 			(gMainInterface && gMainInterface->mainImage && gMainInterface->mainImage->IsUsed())
 			|| mcpScene::JobActive();
 		result["render_running"] = rendering;
+		result["checkpoints"] = mcpScene::Checkpoints();
+		if (gMainInterface)
+		{
+			const QString dialog = gMainInterface->OpenResumeDialogSource();
+			if (!dialog.isEmpty()) result["resume_dialog"] = dialog;
+		}
 		result["headless_command"] = "mandelbulber2 --mcp";
 		return result;
 	}
+
+	if (method == "program_facts") return ProgramFacts();
 
 	if (method == "get_state")
 	{
@@ -786,6 +1186,15 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 			item["name"] = it.key();
 			item["value"] = mcpCatalog::ParameterRecord(container, name).value("value");
 			applied.append(item);
+			if (name == "limit_CPU_cores" || name == "threads_priority")
+			{
+				McpMarkThreadSettingsOverridden();
+				if (gPar->IfExists("limit_CPU_cores"))
+					systemData.numberOfThreads = gPar->Get<int>("limit_CPU_cores");
+				if (gPar->IfExists("threads_priority"))
+					systemData.threadsPriority =
+						enumRenderingThreadPriority(gPar->Get<int>("threads_priority"));
+			}
 		}
 		if (!applied.isEmpty()) RememberEdit();
 		QJsonObject result;
@@ -897,6 +1306,24 @@ QJsonObject cMcpServer::Dispatch(const QString &method, const QJsonObject &param
 		QJsonObject result;
 		result["saved"] = target;
 		result["note"] = "The live session is unchanged apart from remembering this as the last file.";
+		return result;
+	}
+
+	if (method == "list_presets") return ListPresets();
+	if (method == "inspect_preset") return InspectPreset(params);
+	if (method == "save_preset") return SavePreset(params);
+	if (method == "delete_preset") return DeletePreset(params);
+	if (method == "load_preset")
+	{
+		QString error;
+		const QList<QString> matches = MatchPresets(params.value("name").toString(), &error);
+		if (!error.isEmpty()) return Fail(error);
+		if (!LoadFractFile(matches.first(), &error)) return Fail(error);
+		QJsonObject result;
+		result["loaded"] = matches.first();
+		result["agent"] = RenderWindow::PresetFileIsAgent(matches.first());
+		result["summary"] = StateSummary();
+		result["undo"] = "One undo returns to the session from before this load.";
 		return result;
 	}
 

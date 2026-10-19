@@ -39,6 +39,7 @@
 #include "scheduler.hpp"
 
 #include <QDebug>
+#include <QMutexLocker>
 
 #include "system_data.hpp"
 
@@ -229,6 +230,8 @@ int cScheduler::FindBiggestGap() const
 
 void cScheduler::InitFirstLine(int threadId, int firstLine)
 {
+	// A resumed line is already marked done. Do not hand it to this thread.
+	if (firstLine >= startLine && firstLine < endLine && lineDone[firstLine]) return;
 	linePendingThreadId[firstLine] = threadId;
 }
 
@@ -244,6 +247,12 @@ QList<int> cScheduler::GetLastRenderedLines()
 		}
 	}
 	return list;
+}
+
+QList<int> cScheduler::SnapshotDoneLines()
+{
+	QMutexLocker locker(&mutex);
+	return CreateDoneList();
 }
 
 double cScheduler::PercentDone() const
