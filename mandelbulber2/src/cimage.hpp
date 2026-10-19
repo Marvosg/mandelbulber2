@@ -351,7 +351,8 @@ public:
 	const quint8 *GetPreviewConstPtr() const;
 	const quint8 *GetPreviewPrimaryConstPtr() const;
 	bool IsPreview() const;
-	void RedrawInWidget(QWidget *qWidget = nullptr);
+	void RedrawInWidget(QWidget *qWidget = nullptr, int cornerRadius = 0);
+	QImage RenderPreviewImage(int cornerRadius, qreal devicePixelRatio, bool *previewAdvanced = nullptr);
 	double GetPreviewScale() const { return previewScale; }
 	void Squares(quint64 y, int progressiveFactor);
 	void CalculateGammaTable();

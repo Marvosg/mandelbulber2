@@ -159,6 +159,8 @@ void cDockNavigation::ConnectSignals() const
 		SLOT(slotChangedOpenCLMode(int)));
 	connect(
 		ui->pushButton_openNavigator, &QPushButton::clicked, this, &cDockNavigation::slotOpenNavigator);
+	connect(ui->checkBox_auto_refresh, qOverload<bool>(&QCheckBox::clicked), this,
+		&cDockNavigation::slotAutoRefreshClicked);
 }
 
 void cDockNavigation::slotCameraMove()
@@ -225,6 +227,13 @@ void cDockNavigation::slotPressedButtonResetView()
 void cDockNavigation::slotStartRender()
 {
 	emit signalRender();
+}
+
+void cDockNavigation::slotAutoRefreshClicked(bool checked)
+{
+	if (!gMainInterface) return;
+	gMainInterface->SetAutoRefreshEnabled(checked);
+	if (checked) gMainInterface->RenderViewportIfAutoRefresh();
 }
 
 void cDockNavigation::slotStopRender()

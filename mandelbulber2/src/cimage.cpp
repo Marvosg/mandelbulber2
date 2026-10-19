@@ -798,30 +798,55 @@ bool cImage::IsPreview() const
 	}
 }
 
-void cImage::RedrawInWidget(QWidget *qWidget)
+QImage cImage::RenderPreviewImage(int cornerRadius, qreal devicePixelRatio, bool *previewAdvanced)
+{
+	QImage rounded;
+	if (!IsPreview()) return rounded;
+
+	previewMutex.lock();
+	QImage qImage(GetPreviewConstPtr(), int(previewWidth), int(previewHeight),
+		int(previewWidth * sizeof(sRGB8)), QImage::Format_RGB888);
+	const QRect dest(0, 0, int(previewWidth / dpiScale), int(previewHeight / dpiScale));
+	if (dest.width() > 0 && dest.height() > 0)
+	{
+		const qreal dpr = devicePixelRatio > 0.0 ? devicePixelRatio : 1.0;
+		rounded = QImage(QSize(qRound(dest.width() * dpr), qRound(dest.height() * dpr)),
+			QImage::Format_ARGB32_Premultiplied);
+		rounded.setDevicePixelRatio(dpr);
+		rounded.fill(Qt::transparent);
+
+		QPainter mask(&rounded);
+		mask.setRenderHint(QPainter::Antialiasing);
+		mask.setPen(Qt::NoPen);
+		mask.setBrush(Qt::white);
+		const QRectF box(0, 0, dest.width(), dest.height());
+		if (cornerRadius > 0) mask.drawRoundedRect(box, cornerRadius, cornerRadius);
+		else
+			mask.drawRect(box);
+		mask.setCompositionMode(QPainter::CompositionMode_SourceIn);
+		mask.drawImage(box, qImage, QRectF(0, 0, previewWidth, previewHeight));
+		mask.end();
+	}
+	const bool advanced = preview.size() != preview2.size()
+											|| (preview.size() > 0
+													&& memcmp(preview.data(), preview2.data(), preview.size() * sizeof(sRGB8)) != 0);
+	preview2 = preview;
+	if (previewAdvanced) *previewAdvanced = advanced;
+	previewMutex.unlock();
+	return rounded;
+}
+
+void cImage::RedrawInWidget(QWidget *qWidget, int cornerRadius)
 {
 	if (IsPreview())
 	{
 		// qDebug() << "Redraw" << endl;
-		previewMutex.lock();
-
-		QWidget *widget;
-		if (qWidget)
-			widget = qWidget;
-		else
-			widget = imageWidget;
-
+		QWidget *widget = qWidget ? qWidget : imageWidget;
+		const QImage frame = RenderPreviewImage(cornerRadius, widget->devicePixelRatioF());
+		if (frame.isNull()) return;
 		QPainter painter(widget);
 		painter.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
-
-		QImage qImage(GetPreviewConstPtr(), int(previewWidth), int(previewHeight),
-			int(previewWidth * sizeof(sRGB8)), QImage::Format_RGB888);
-
-		painter.drawImage(QRect(0, 0, int(previewWidth / dpiScale), int(previewHeight / dpiScale)),
-			qImage, QRect(0, 0, int(previewWidth), int(previewHeight)));
-
-		preview2 = preview;
-		previewMutex.unlock();
+		painter.drawImage(QPointF(0, 0), frame);
 	}
 }
 

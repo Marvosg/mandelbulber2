@@ -528,6 +528,9 @@ double CalculateDistanceFromObjectsTree(const sParamRender &params,
 		out->transformedPoint = stack[0].transformedPoint;
 		out->hasTransformedPoint = stack[0].hasTransformedPoint;
 		out->iters = totalIters;
+		// The histogram uses iters. The CLI "Total number of iters" line adds
+		// totalIters, which was left at the 0 written at the start of this function.
+		out->totalIters = totalIters;
 		out->detailLevelMultiplier = 1.0;
 		if (stack[0].closestObjectId >= 0
 				&& stack[0].closestObjectId < static_cast<int>(data->objectData.size()))

@@ -961,7 +961,7 @@ void cKeyframeAnimation::UpadeProgressInformation(
 
 bool cKeyframeAnimation::RenderKeyframes(bool *stopRequest)
 {
-	mainInterface->DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	if (image->IsUsed())
 	{
@@ -1106,12 +1106,14 @@ bool cKeyframeAnimation::RenderKeyframes(bool *stopRequest)
 			renderJob->UpdateParameters(params, fractalParams);
 			renderJob->renderContext =
 				QString("keyframe %1/%2").arg(frameIndex + 1).arg(frameRanges.totalFrames);
+			const QString filename = GetKeyframeFilename(index, subIndex, gNetRender->IsClient());
+			if (!gNetRender->IsClient() && !gNetRender->IsServer())
+				renderJob->EnableCheckpoint(QString("window"), filename, QString("keyframe"));
 			result = renderJob->Execute();
 			if (!result) throw false;
 
 			// save frame
 			QStringList listOfSavedFiles;
-			const QString filename = GetKeyframeFilename(index, subIndex, gNetRender->IsClient());
 
 			if (gNetRender->IsClient())
 			{

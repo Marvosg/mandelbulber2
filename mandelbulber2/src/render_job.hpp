@@ -95,6 +95,17 @@ public:
 	cStatistics GetStatistics() const;
 	void RefreshImageAdjustments();
 	void RefreshPostEffects();
+	// A stop that is already true survives Execute. The window still clears the
+	// flag, so the next GUI render after a stop is not stuck stopped.
+	void PreserveStopRequest() { preserveStopRequest = true; }
+	// source is "window" or "background". output is the still path without .png.
+	void EnableCheckpoint(const QString &source, const QString &output,
+		const QString &kind = QString("still"))
+	{
+		checkpointSource = source;
+		checkpointOutput = output;
+		checkpointKind = kind;
+	}
 
 public slots:
 	void slotExecute();
@@ -128,6 +139,7 @@ private:
 #endif
 
 	void LoadTextures(int frameNo, const cRenderingConfiguration &config);
+	void ResetStopFlag();
 
 	bool hasQWidget;
 	bool inProgress;
@@ -144,7 +156,11 @@ private:
 	QWidget *imageWidget;
 	std::shared_ptr<sRenderData> renderData;
 	bool *stopRequest;
+	bool preserveStopRequest;
 	bool canUseNetRender;
+	QString checkpointSource;
+	QString checkpointOutput;
+	QString checkpointKind;
 
 	static int id; // global identifier of actual rendering job
 	static int runningJobs;

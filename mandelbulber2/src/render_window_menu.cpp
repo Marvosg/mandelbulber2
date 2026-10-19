@@ -467,8 +467,8 @@ void RenderWindow::slotMenuLoadSettings()
 
 void RenderWindow::slotMenuLoadSettingsFromFile(QString fileName)
 {
+	cAutoRefreshPause autoRefreshPause;
 	cSettings parSettings(cSettings::formatFullText);
-	gMainInterface->DisablePeriodicRefresh();
 	gInterfaceReadyForSynchronization = false;
 	parSettings.LoadFromFile(fileName);
 	parSettings.Decode(gPar, gParFractal, gAnimFrames, gKeyframes);
@@ -489,7 +489,7 @@ void RenderWindow::slotMenuLoadSettingsFromFile(QString fileName)
 
 void RenderWindow::slotMenuLoadSettingsFromClipboard()
 {
-	gMainInterface->DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	gMainInterface->SynchronizeInterface(
 		gPar, gParFractal, qInterface::read); // update appParam before loading new settings
@@ -498,7 +498,6 @@ void RenderWindow::slotMenuLoadSettingsFromClipboard()
 
 	if (parSettings.LoadFromClipboard())
 	{
-		gMainInterface->DisablePeriodicRefresh();
 		gInterfaceReadyForSynchronization = false;
 		parSettings.Decode(gPar, gParFractal, gAnimFrames, gKeyframes);
 		gMainInterface->materialListModel->Regenerate();
@@ -512,7 +511,6 @@ void RenderWindow::slotMenuLoadSettingsFromClipboard()
 		setWindowTitle(QString("Mandelbulber (") + "from clipboard" + ")");
 		gFlightAnimation->RefreshTable();
 		gKeyframeAnimation->RefreshTable();
-		gMainInterface->ReEnablePeriodicRefresh();
 		showDescriptionPopup();
 	}
 	else
@@ -570,6 +568,7 @@ void RenderWindow::slotMenuResetDocksPositions()
 	tabifyDockWidget(ui->dockWidget_objects, ui->dockWidget_histogram);
 
 	addDockWidget(Qt::LeftDockWidgetArea, ui->dockWidget_Materials);
+	PlaceBackgroundRendersDock();
 }
 
 void RenderWindow::slotMenuAnimationDocksPositions()
@@ -591,6 +590,22 @@ void RenderWindow::slotMenuAnimationDocksPositions()
 	tabifyDockWidget(ui->dockWidget_objects, ui->dockWidget_histogram);
 
 	addDockWidget(Qt::LeftDockWidgetArea, ui->dockWidget_Materials);
+	PlaceBackgroundRendersDock();
+}
+
+void RenderWindow::PlaceBackgroundRendersDock()
+{
+	QDockWidget *dock = ui->dockWidget_background_renders;
+	QDockWidget *measurement = ui->dockWidget_measurement;
+	addDockWidget(Qt::RightDockWidgetArea, dock);
+	splitDockWidget(measurement, dock, Qt::Vertical);
+	dock->show();
+	dock->raise();
+	if (measurement->isVisible())
+	{
+		const int total = qMax(1, measurement->height() + dock->height());
+		resizeDocks({measurement, dock}, {total * 2 / 3, qMax(160, total / 3)}, Qt::Vertical);
+	}
 }
 
 void RenderWindow::slotMenuSaveDocksPositions()
@@ -910,6 +925,18 @@ void RenderWindow::slotUpdateDocksAndToolbarByAction()
 		}
 		ui->dockWidget_measurement->setVisible(ui->actionShow_measurement_dock->isChecked());
 	}
+
+	if (ui->actionShow_background_renders_dock->isChecked()
+		!= ui->dockWidget_background_renders->isVisible())
+	{
+		if (ui->actionShow_background_renders_dock->isChecked())
+			PlaceBackgroundRendersDock();
+		else
+		{
+			removeDockWidget(ui->dockWidget_background_renders);
+			ui->dockWidget_background_renders->setVisible(false);
+		}
+	}
 }
 
 void RenderWindow::slotUpdateDocksAndToolbarByView() const
@@ -956,6 +983,12 @@ void RenderWindow::slotUpdateDocksAndToolbarByView() const
 	if (ui->actionShow_measurement_dock->isChecked() != ui->dockWidget_measurement->isVisible())
 	{
 		ui->actionShow_measurement_dock->setChecked(ui->dockWidget_measurement->isVisible());
+	}
+
+	if (ui->actionShow_background_renders_dock->isChecked()
+		!= ui->dockWidget_background_renders->isVisible())
+	{
+		ui->actionShow_background_renders_dock->setChecked(ui->dockWidget_background_renders->isVisible());
 	}
 }
 

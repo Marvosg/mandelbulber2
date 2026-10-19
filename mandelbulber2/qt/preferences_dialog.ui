@@ -1484,6 +1484,16 @@ and will only be present after enabling and re-render.</string>
                   </property>
                  </widget>
                 </item>
+                <item row="2" column="0" colspan="2">
+                 <widget class="MyCheckBox" name="checkBox_thumbnails_supersampling">
+                  <property name="toolTip">
+                   <string>Render each thumbnail at double resolution and scale it down. Sharper on a high-dpi screen, and slower.</string>
+                  </property>
+                  <property name="text">
+                   <string>Render thumbnails with supersampling</string>
+                  </property>
+                 </widget>
+                </item>
                 <item row="0" column="1">
                  <widget class="QPushButton" name="pushButton_generate_thumbnail_cache">
                   <property name="text">

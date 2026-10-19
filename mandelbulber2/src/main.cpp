@@ -36,6 +36,8 @@
 
 #include <qapplication.h>
 
+#include <QTextStream>
+
 #include "animation_flight.hpp"
 #include "animation_keyframes.hpp"
 #include "cimage.hpp"
@@ -45,6 +47,7 @@
 #include "headless.h"
 #include "initparameters.hpp"
 #include "interface.hpp"
+#include "mcp_server.h"
 #include "netrender.hpp"
 #include "opencl_engine_render_fractal.h"
 #include "opencl_global.h"
@@ -215,6 +218,24 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	// The socket starts before the autosave-recovery dialog. That dialog runs a
+	// nested event loop, and the server has to answer while it is on screen.
+	// The undo baseline is taken after the dialog, so the first undo is the
+	// scene the user kept.
+	gInterfaceReadyForSynchronization = true;
+	gUndo = new cUndo(gMainInterface);
+
+	if (!commandLineInterface.isNoGUI() || commandLineInterface.isMcp())
+	{
+		gMcpServer = new cMcpServer();
+		if (!gMcpServer->Start() && commandLineInterface.isMcp())
+		{
+			QTextStream err(stderr);
+			err << "mandelbulber2 --mcp: another instance already owns the session socket\n";
+			return 2;
+		}
+	}
+
 	// write parameters to ui
 	bool dataFoldersUpdated = false;
 	if (!commandLineInterface.isNoGUI())
@@ -226,16 +247,12 @@ int main(int argc, char *argv[])
 		bool recovered = gMainInterface->AutoRecovery();
 		if (!recovered) gMainInterface->LoadDefaultSettings();
 		gMainInterface->InitPeriodicRefresh();
-	}
-
-	gInterfaceReadyForSynchronization = true;
-
-	gUndo = new cUndo(gMainInterface);
-
-	if (!commandLineInterface.isNoGUI())
-	{
 		gMainInterface->mainWindow->slotPopulateToolbar();
+		const bool resumingWindow = gMainInterface->OfferRenderResume();
+		if (!resumingWindow) gMainInterface->RenderViewportIfAutoRefresh();
 	}
+
+	if (gMcpServer) gMcpServer->NoteBaseline();
 
 	commandLineInterface.ProcessCLI();
 
@@ -244,11 +261,16 @@ int main(int argc, char *argv[])
 	int result = 0;
 	if (!systemData.globalStopRequest)
 	{
-		if (!commandLineInterface.isNoGUI() && !dataFoldersUpdated) result = gApplication->exec();
+		if (commandLineInterface.isMcp())
+			result = QCoreApplication::instance()->exec();
+		else if (!commandLineInterface.isNoGUI() && !dataFoldersUpdated)
+			result = gApplication->exec();
 	}
 
 	// clean objects when exit
 
+	delete gMcpServer;
+	gMcpServer = nullptr;
 	delete gMainInterface;
 	delete gApplication;
 

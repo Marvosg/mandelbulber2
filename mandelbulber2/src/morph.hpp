@@ -75,7 +75,11 @@ public:
 	cMorph &operator=(const cMorph &source);
 	void AddData(const int keyframe, const int noOfSubFrames, const cOneParameter &val);
 	int findInMorph(const int keyframe);
-	void Clear() { dataSets.clear(); }
+	void Clear()
+	{
+		dataSets.clear();
+		frameIndices.clear();
+	}
 	cOneParameter Interpolate(int frameIndex);
 	cOneParameter None(const int key) const;
 	cOneParameter Linear(const int key, const double factor, bool const angular);

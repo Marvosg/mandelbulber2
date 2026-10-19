@@ -1,0 +1,18 @@
+[project]
+name = "mandelbulber-mcp"
+version = "0.1.0"
+description = "MCP server for a live Mandelbulber 2 session"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+dependencies = ["mcp>=2"]
+
+[project.scripts]
+mandelbulber-mcp = "mandelbulber_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mandelbulber_mcp*"]

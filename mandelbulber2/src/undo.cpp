@@ -56,6 +56,7 @@ cUndo::cUndo(QObject *parent) : QObject(parent)
 {
 	level = 0;
 	fileIndex = 0;
+	sessionFloor = 0;
 
 	QDir undoDir(systemDirectories.GetUndoFolder());
 	QStringList listOfFiles = undoDir.entryList(QStringList() << "*.fract", QDir::Files, QDir::Time);
@@ -117,6 +118,15 @@ void cUndo::Store(std::shared_ptr<cParameterContainer> par,
 	WriteLog("cUndo::Store() finished", 2);
 }
 
+void cUndo::CommitNow()
+{
+	if (timer && timer->isActive())
+	{
+		timer->stop();
+		slotDelayedStore();
+	}
+}
+
 bool cUndo::Undo(std::shared_ptr<cParameterContainer> par,
 	std::shared_ptr<cFractalContainer> parFractal, std::shared_ptr<cAnimationFrames> frames,
 	std::shared_ptr<cKeyframes> keyframes, bool *refreshFrames, bool *refreshKeyframes)
@@ -159,7 +169,9 @@ bool cUndo::Undo(std::shared_ptr<cParameterContainer> par,
 
 			if (record.isLoaded)
 			{
+				const bool keepAutoRefresh = par->Get<bool>("auto_refresh");
 				*par = *record.mainParams;
+				par->Set("auto_refresh", keepAutoRefresh);
 				parFractal->ResetDataFrom(*record.fractParams);
 				if (frames && record.hasFrames)
 				{
@@ -195,7 +207,9 @@ bool cUndo::Redo(std::shared_ptr<cParameterContainer> par,
 		fileIndex = (fileIndex + 1 + 100) % 100;
 		if (record.isLoaded)
 		{
+			const bool keepAutoRefresh = par->Get<bool>("auto_refresh");
 			*par = *record.mainParams;
+			par->Set("auto_refresh", keepAutoRefresh);
 			parFractal->ResetDataFrom(*record.fractParams);
 			if (frames && record.hasFrames)
 			{
@@ -254,6 +268,8 @@ void cUndo::slotDelayedStore()
 	if (undoBuffer.size() > 100)
 	{
 		undoBuffer.removeFirst();
+		// Indices shifted down by one. Keep the MCP floor on the same snapshot.
+		if (sessionFloor > 0) sessionFloor--;
 	}
 	else
 	{

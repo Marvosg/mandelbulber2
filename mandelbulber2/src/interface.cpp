@@ -34,6 +34,9 @@
 
 #include "interface.hpp"
 
+#include <QMessageBox>
+#include <QTimer>
+
 #include "ui_render_window.h"
 
 #include "animation_flight.hpp"
@@ -53,6 +56,7 @@
 #include "lights.hpp"
 #include "manipulations.h"
 #include "material_item_model.h"
+#include "mcp_scene.h"
 #include "my_ui_loader.h"
 #include "netrender.hpp"
 #include "opencl_engine_render_dof.h"
@@ -64,6 +68,7 @@
 #include "queue.hpp"
 #include "random.hpp"
 #include "randomizer_dialog.h"
+#include "render_checkpoint.hpp"
 #include "render_data.hpp"
 #include "render_job.hpp"
 #include "render_ssao.h"
@@ -91,6 +96,9 @@
 #include "qt/settings_cleaner.h"
 #include "qt/system_tray.hpp"
 
+#include <QGuiApplication>
+#include <QScreen>
+
 // custom includes
 #ifdef USE_GAMEPAD
 #include <QtGamepad/qgamepadmanager.h>
@@ -109,6 +117,7 @@ cInterface::cInterface(QObject *parent) : QObject(parent)
 	mainImage = nullptr;
 	progressBar = nullptr;
 	progressBarAnimation = nullptr;
+	progressBarBackground = nullptr;
 	progressBarFrame = nullptr;
 	progressBarLayout = nullptr;
 	autoRefreshTimer = nullptr;
@@ -119,7 +128,7 @@ cInterface::cInterface(QObject *parent) : QObject(parent)
 	systemTray = nullptr;
 	stopRequest = false;
 	repeatRequest = false;
-	autoRefreshLastState = false;
+	autoRefreshPauseCount = 0;
 	lockedDetailLevel = 1.0;
 	lastSelectedMaterial = 1;
 }
@@ -134,6 +143,47 @@ cInterface::~cInterface()
 
 	if (imageSequencePlayer) delete imageSequencePlayer;
 	if (mainWindow) delete mainWindow;
+}
+
+void cInterface::ShowBackgroundRenderProgress(
+	const QString &kind, const QString &progressText, double progress)
+{
+	if (!mainWindow || !progressBarBackground) return;
+	QString title = tr("Background render");
+	if (kind == "preview")
+		title = tr("Background preview");
+	else if (kind == "keyframe" || kind == "flight")
+		title = tr("Background animation");
+	int running = 0;
+	for (const mcpScene::sBackgroundRender &job : mcpScene::BackgroundRenders())
+		if (job.running) running++;
+	if (running > 1) title = tr("%1 background renders").arg(running);
+	const bool wasHidden = !progressBarBackground->isVisible();
+	if (wasHidden) progressBarBackground->setVisible(true);
+	progressBarBackground->setValue(int(qBound(0.0, progress, 1.0) * 1000.0));
+	progressBarBackground->setTextVisible(true);
+	progressBarBackground->setFormat(
+		progressText.isEmpty() ? title : QString("%1   %2").arg(title, progressText));
+	if (wasHidden) mainWindow->ui->statusbar->showMessage(title);
+	if (mainWindow->ui->widgetDockBackgroundRenders)
+		mainWindow->ui->widgetDockBackgroundRenders->Refresh();
+}
+
+void cInterface::HideBackgroundRenderProgress()
+{
+	if (!mainWindow || !progressBarBackground) return;
+	if (mainWindow->ui->widgetDockBackgroundRenders)
+		mainWindow->ui->widgetDockBackgroundRenders->Refresh();
+	int running = 0;
+	for (const mcpScene::sBackgroundRender &job : mcpScene::BackgroundRenders())
+		if (job.running) running++;
+	if (running > 0) return;
+	progressBarBackground->hide();
+	progressBarBackground->setValue(0);
+	const QString message = mainWindow->ui->statusbar->currentMessage();
+	if (message == tr("Background render") || message == tr("Background preview")
+		|| message == tr("Background animation") || message.endsWith(tr("background renders")))
+		mainWindow->ui->statusbar->clearMessage();
 }
 
 void cInterface::ShowUi()
@@ -197,8 +247,12 @@ void cInterface::ShowUi()
 	mainImage->ConvertTo8bitChar();
 	mainImage->UpdatePreview();
 	mainImage->SetAsMainImage();
-	renderedImage->setMinimumSize(
-		int(mainImage->GetPreviewWidth()), int(mainImage->GetPreviewHeight()));
+	// Preview storage is in device pixels. The widget size is in logical points;
+	// using the device size here makes the view claim the screen and pushes the
+	// right-hand dock past the edge.
+	const double previewDpi = renderedImage->devicePixelRatioF();
+	renderedImage->setMinimumSize(int(mainImage->GetPreviewWidth() / previewDpi),
+		int(mainImage->GetPreviewHeight() / previewDpi));
 	renderedImage->AssignImage(mainImage);
 	renderedImage->AssignParameters(gPar, gParFractal);
 
@@ -233,6 +287,15 @@ void cInterface::ShowUi()
 	progressBar->setMaximum(1000);
 	progressBar->setAlignment(Qt::AlignCenter);
 	progressBarLayout->addWidget(progressBar);
+
+	progressBarBackground = new MyProgressBar(progressBarFrame);
+	progressBarBackground->setMaximum(1000);
+	progressBarBackground->setAlignment(Qt::AlignCenter);
+	progressBarBackground->setMinimumWidth(420);
+	progressBarBackground->setToolTip(QObject::tr(
+		"Renders started through the MCP connection. The Background renders dock lists each one and can stop it. The image in this window is left as it is."));
+	progressBarBackground->hide();
+	progressBarLayout->insertWidget(0, progressBarBackground);
 
 	QFrame *progressBarFrameInternal = new QFrame(mainWindow->ui->statusbar);
 	progressBarFrameInternal->setLayout(progressBarLayout);
@@ -309,13 +372,24 @@ void cInterface::ShowUi()
 	mainWindow->slotPopulateCustomWindowStates();
 	systemTray = new cSystemTray(mainImage, mainWindow);
 
+	// installing event filter for disabling tooltips
+	gApplication->installEventFilter(mainWindow);
+
+	WriteLog("cInterface::ConnectSignals(void)", 2);
+	ConnectSignals();
+	WriteLog("cInterface::ConnectSignals(void) finished", 2);
+
 	WriteLog("Restoring window geometry", 2);
 
-	mainWindow->restoreGeometry(settings.value("mainWindowGeometry").toByteArray());
+	const QByteArray savedGeometry = settings.value("mainWindowGeometry").toByteArray();
+	if (!savedGeometry.isEmpty())
+		renderedImage->setMinimumSize(0, 0);
+	mainWindow->restoreGeometry(savedGeometry);
 
 	WriteLog("Restoring window state", 2);
 
-	if (!mainWindow->restoreState(settings.value("mainWindowState").toByteArray()))
+	const QByteArray savedState = settings.value("mainWindowState").toByteArray();
+	if (!mainWindow->restoreState(savedState))
 	{
 		mainWindow->tabifyDockWidget(
 			mainWindow->ui->dockWidget_materialEditor, mainWindow->ui->dockWidget_effects);
@@ -332,13 +406,27 @@ void cInterface::ShowUi()
 		mainWindow->ui->dockWidget_histogram->hide();
 		mainWindow->ui->dockWidget_queue_dock->hide();
 	}
+	if (!savedState.contains("dockWidget_background_renders"))
+		mainWindow->PlaceBackgroundRendersDock();
 
-	// installing event filter for disabling tooltips
-	gApplication->installEventFilter(mainWindow);
-
-	WriteLog("cInterface::ConnectSignals(void)", 2);
-	ConnectSignals();
-	WriteLog("cInterface::ConnectSignals(void) finished", 2);
+	// Docks are in their final places now. Keep the whole frame, including the
+	// navigation dock to the right of the view, inside the visible screen.
+	QScreen *screen = mainWindow->screen();
+	if (!screen) screen = QGuiApplication::primaryScreen();
+	if (screen)
+	{
+		const QRect available = screen->availableGeometry();
+		const QRect frame = mainWindow->frameGeometry();
+		const int maxWidth = available.width() - (frame.width() - mainWindow->width());
+		const int maxHeight = available.height() - (frame.height() - mainWindow->height());
+		if (mainWindow->width() > maxWidth || mainWindow->height() > maxHeight)
+		{
+			renderedImage->setMinimumSize(0, 0);
+			mainWindow->setMinimumSize(0, 0);
+			mainWindow->resize(
+				qMin(mainWindow->width(), maxWidth), qMin(mainWindow->height(), maxHeight));
+		}
+	}
 }
 
 void cInterface::ConnectSignals() const
@@ -424,6 +512,8 @@ void cInterface::ConnectSignals() const
 	connect(mainWindow->ui->actionShow_queue_dock, &QAction::triggered, mainWindow,
 		&RenderWindow::slotUpdateDocksAndToolbarByAction);
 	connect(mainWindow->ui->actionShow_measurement_dock, &QAction::triggered, mainWindow,
+		&RenderWindow::slotUpdateDocksAndToolbarByAction);
+	connect(mainWindow->ui->actionShow_background_renders_dock, &QAction::triggered, mainWindow,
 		&RenderWindow::slotUpdateDocksAndToolbarByAction);
 	connect(mainWindow->ui->actionSave_settings, &QAction::triggered, mainWindow,
 		&RenderWindow::slotMenuSaveSettings);
@@ -544,6 +634,13 @@ void cInterface::ConnectSignals() const
 		SLOT(slotUpdateDocksAndToolbarByView()));
 	connect(mainWindow->ui->dockWidget_measurement, SIGNAL(visibilityChanged(bool)), mainWindow,
 		SLOT(slotUpdateDocksAndToolbarByView()));
+	connect(mainWindow->ui->dockWidget_background_renders, SIGNAL(visibilityChanged(bool)), mainWindow,
+		SLOT(slotUpdateDocksAndToolbarByView()));
+	connect(mainWindow->ui->widgetDockBackgroundRenders, &cDockBackgroundRenders::requestShow,
+		mainWindow, [this]() {
+			if (!mainWindow || !mainWindow->ui->dockWidget_background_renders->isVisible())
+				mainWindow->PlaceBackgroundRendersDock();
+		});
 
 	connect(mainWindow->ui->actionAdd_Settings_to_Toolbar, &QAction::triggered, mainWindow,
 		&RenderWindow::slotPresetAddToToolbar);
@@ -636,19 +733,18 @@ void cInterface::StartRender(bool noUndo)
 	progressBarAnimation->hide();
 	SynchronizeInterface(gPar, gParFractal, qInterface::read);
 
-	if (mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked())
-	{
-		// check if something was changed in settings
-		cSettings tempSettings(cSettings::formatCondensedText);
-		tempSettings.CreateText(gPar, gParFractal);
-		autoRefreshLastHash = tempSettings.GetHashCode();
-	}
-
 	cScripts::EvaluateAll(gPar, gParFractal);
 
 	UpdateCameraRotation(gPar);
 
 	SynchronizeInterface(gPar, gParFractal, qInterface::write);
+
+	// Hash the scene the render will actually use. Capturing it before the script
+	// and camera update made the next auto-refresh look like an edit, so it stored
+	// a second identical undo a moment after the MCP session floor.
+	cSettings tempSettings(cSettings::formatCondensedText);
+	tempSettings.CreateText(gPar, gParFractal);
+	autoRefreshLastHash = tempSettings.GetHashCode();
 
 	if (!noUndo) gUndo->Store(gPar, gParFractal);
 
@@ -680,6 +776,7 @@ void cInterface::StartRender(bool noUndo)
 	WriteLog(QString("Starting rendering of %1").arg(renderJob->settingsFile), 1);
 	if (!renderJob->Init(cRenderJob::still, config))
 	{
+		renderCheckpoint::Disarm(QString("window"));
 		mainImage->ReleaseImage();
 		cErrorMessage::showMessage(
 			QObject::tr("Cannot init renderJob, see log output for more information."),
@@ -1425,10 +1522,11 @@ bool cInterface::QuitApplicationDialog()
 
 			QFile::remove(systemDirectories.GetAutosaveFile());
 
+			if (mainWindow)
+				settings.setValue("mainWindowGeometry", mainWindow->saveGeometry());
 			if (detachedWindow)
-			{
 				settings.setValue("detachedWindowGeometry", detachedWindow->saveGeometry());
-			}
+			settings.sync();
 
 			ClearNetRenderCache();
 
@@ -1472,6 +1570,182 @@ bool cInterface::AutoRecovery() const
 		}
 	}
 	return false;
+}
+
+namespace
+{
+QMessageBox *gResumeDialog = nullptr;
+QString gResumeDialogSource;
+} // namespace
+
+bool cInterface::LoadWindowCheckpoint(const renderCheckpoint::sSummary &item)
+{
+	const bool animationFrame = item.kind == QString("flight") || item.kind == QString("keyframe");
+	if (!animationFrame)
+	{
+		if (!renderCheckpoint::LoadSettings(item.source, gPar, gParFractal)) return false;
+		materialListModel->Regenerate();
+		mainWindow->ui->widgetEffects->RegenerateLights();
+		SynchronizeInterface(gPar, gParFractal, qInterface::write);
+		gFlightAnimation->RefreshTable();
+		gKeyframeAnimation->RefreshTable();
+	}
+	renderCheckpoint::Arm(item.source, animationFrame ? item.output : QString());
+	return true;
+}
+
+QString cInterface::OpenResumeDialogSource() const
+{
+	return gResumeDialog ? gResumeDialogSource : QString();
+}
+
+bool cInterface::AnswerResumeDialog(const QString &source, bool accept)
+{
+	if (!gResumeDialog) return false;
+	if (!source.isEmpty() && source != gResumeDialogSource) return false;
+	gResumeDialog->done(accept ? QMessageBox::Yes : QMessageBox::No);
+	return true;
+}
+
+bool cInterface::StartWindowResume()
+{
+	if (mainImage && mainImage->IsUsed()) return false;
+	const renderCheckpoint::sSummary item = renderCheckpoint::Summary(QString("window"));
+	if (!item.valid) return false;
+	if (!LoadWindowCheckpoint(item)) return false;
+	const QString windowKind = item.kind;
+	QTimer::singleShot(0, this, [this, windowKind]() {
+		if (windowKind == QString("flight"))
+			gFlightAnimation->RenderFlight(&stopRequest);
+		else if (windowKind == QString("keyframe"))
+			gKeyframeAnimation->RenderKeyframes(&stopRequest);
+		else
+			StartRender(true);
+	});
+	return true;
+}
+
+bool cInterface::OfferRenderResume()
+{
+	const QList<renderCheckpoint::sSummary> found = renderCheckpoint::List();
+	bool resumeWindow = false;
+	bool resumeBackground = false;
+	QString windowKind;
+	for (const renderCheckpoint::sSummary &item : found)
+	{
+		// The viewport render is the interactive window picture. It is not resumed.
+		if (item.source == QString("window") && item.kind == QString("still"))
+		{
+			renderCheckpoint::Discard(item.source);
+			continue;
+		}
+		QString kind = item.source == QString("window") ? QObject::tr("Window render")
+																										: QObject::tr("Background render");
+		if (item.animation)
+			kind = QObject::tr("Background animation");
+		else if (item.kind == QString("flight"))
+			kind = QObject::tr("Flight animation");
+		else if (item.kind == QString("keyframe"))
+			kind = QObject::tr("Keyframe animation");
+		QString text;
+		if (item.animation)
+		{
+			text = QObject::tr("An animation was interrupted and can be resumed.\n\n"
+												 "%1, frame %2 of %3, %4×%5, %6 of %7 lines finished on this frame. "
+												 "The remaining frames render after it.")
+							 .arg(kind)
+							 .arg(item.animFrame + 1)
+							 .arg(item.animEnd)
+							 .arg(item.width)
+							 .arg(item.height)
+							 .arg(item.doneLines)
+							 .arg(item.height);
+		}
+		else if (item.kind == QString("flight") || item.kind == QString("keyframe"))
+		{
+			text = QObject::tr("An animation was interrupted and can be resumed.\n\n"
+												 "%1, %2×%3, %4 of %5 lines finished on this frame. Frames already "
+												 "saved are kept, and the rest of the animation renders after this one.")
+							 .arg(kind)
+							 .arg(item.width)
+							 .arg(item.height)
+							 .arg(item.doneLines)
+							 .arg(item.height);
+		}
+		else
+		{
+			text = QObject::tr("A render was interrupted and can be resumed.\n\n"
+												 "%1, %2×%3, %4 of %5 lines finished.")
+							 .arg(kind)
+							 .arg(item.width)
+							 .arg(item.height)
+							 .arg(item.doneLines)
+							 .arg(item.height);
+		}
+		if (!item.output.isEmpty())
+			text += QObject::tr("\n\nOutput: %1").arg(item.output);
+		text += QObject::tr("\n\nResume it?");
+
+		QMessageBox box(mainWindow);
+		box.setIcon(QMessageBox::Question);
+		box.setWindowTitle(QObject::tr("Resume render"));
+		box.setText(text);
+		box.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+		box.setDefaultButton(QMessageBox::Yes);
+		gResumeDialog = &box;
+		gResumeDialogSource = item.source;
+		const int answer = box.exec();
+		gResumeDialog = nullptr;
+		gResumeDialogSource.clear();
+		if (answer != QMessageBox::Yes)
+		{
+			renderCheckpoint::Discard(item.source);
+			continue;
+		}
+		if (item.source == QString("window"))
+		{
+			windowKind = item.kind;
+			if (!LoadWindowCheckpoint(item))
+			{
+				QMessageBox::warning(mainWindow, QObject::tr("Resume render"),
+					QObject::tr("The saved render settings could not be read. The checkpoint was kept."));
+				continue;
+			}
+			resumeWindow = true;
+		}
+		else
+		{
+			resumeBackground = true;
+		}
+	}
+
+	if (resumeBackground && resumeWindow)
+	{
+		QMessageBox::information(mainWindow, QObject::tr("Resume render"),
+			QObject::tr("The window render is resuming. The background render stays saved and will be "
+									"offered again the next time the application starts."));
+		resumeBackground = false;
+	}
+	else if (resumeBackground)
+	{
+		renderCheckpoint::Arm(QString("background"), QString());
+	}
+
+	if (!resumeWindow && !resumeBackground) return false;
+	QTimer::singleShot(0, this, [this, resumeWindow, resumeBackground, windowKind]() {
+		if (resumeWindow)
+		{
+			if (windowKind == QString("flight"))
+				gFlightAnimation->RenderFlight(&stopRequest);
+			else if (windowKind == QString("keyframe"))
+				gKeyframeAnimation->RenderKeyframes(&stopRequest);
+			else
+				StartRender(true);
+		}
+		else if (resumeBackground && !mcpScene::ResumeBackground())
+			renderCheckpoint::Disarm(QString("background"));
+	});
+	return resumeWindow;
 }
 
 // ReSharper disable once CppMemberFunctionMayBeStatic
@@ -1561,7 +1835,7 @@ void cInterface::SetQuickRenderParameters(const std::shared_ptr<cParameterContai
 
 void cInterface::OptimizeStepFactor(double qualityTarget)
 {
-	DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	// check if main image is not used by other rendering process
 	if (mainImage->IsUsed())
@@ -1663,8 +1937,6 @@ void cInterface::OptimizeStepFactor(double qualityTarget)
 			.arg(DEFactor)
 			.arg(missedDE),
 		1.0, cProgressText::progress_IMAGE);
-
-	ReEnablePeriodicRefresh();
 }
 
 void cInterface::ResetFormula(int fractalNumber) const
@@ -1694,7 +1966,7 @@ void cInterface::ResetFormula(int fractalNumber) const
 
 void cInterface::PeriodicRefresh()
 {
-	if (!mainWindow->manipulations->isDraggingStarted())
+	if (autoRefreshPauseCount == 0 && !mainWindow->manipulations->isDraggingStarted())
 	{
 		if (mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked())
 		{
@@ -1717,25 +1989,74 @@ void cInterface::PeriodicRefresh()
 
 void cInterface::DisablePeriodicRefresh()
 {
-	if (mainWindow)
-	{
-		autoRefreshLastState = mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked();
-		mainWindow->ui->widgetDockNavigation->AutoRefreshSetChecked(false);
-		gPar->Set("auto_refresh", false);
-	}
+	autoRefreshPauseCount++;
 }
 
-void cInterface::ReEnablePeriodicRefresh()
+void cInterface::ReEnablePeriodicRefresh(bool captureHash)
 {
+	if (autoRefreshPauseCount > 0) autoRefreshPauseCount--;
+	if (autoRefreshPauseCount > 0) return;
+	if (captureHash) CaptureAutoRefreshHash();
+}
+
+void cInterface::CaptureAutoRefreshHash()
+{
+	if (!mainWindow || !gPar || !gParFractal) return;
 	SynchronizeInterface(gPar, gParFractal, qInterface::read);
 	cSettings tempSettings(cSettings::formatCondensedText);
 	tempSettings.CreateText(gPar, gParFractal);
 	autoRefreshLastHash = tempSettings.GetHashCode();
-	if (autoRefreshLastState)
-	{
-		mainWindow->ui->widgetDockNavigation->AutoRefreshSetChecked(true);
-		gPar->Set("auto_refresh", true);
-	}
+}
+
+void cInterface::SetAutoRefreshEnabled(bool enabled)
+{
+	if (!gPar) return;
+	gPar->Set("auto_refresh", enabled);
+	if (!mainWindow || !gInterfaceReadyForSynchronization) return;
+
+	SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	gPar->Set("auto_refresh", enabled);
+	cSettings parSettings(cSettings::formatAppSettings);
+	parSettings.CreateText(gPar, gParFractal, gAnimFrames, gKeyframes);
+	parSettings.SaveToFile(systemData.GetIniFile());
+}
+
+void cInterface::RenderViewportIfAutoRefresh()
+{
+	if (!mainWindow || !mainImage || !gPar || !gParFractal) return;
+	if (autoRefreshPauseCount > 0) return;
+	if (!mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked()) return;
+
+	SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	cSettings current(cSettings::formatCondensedText);
+	current.CreateText(gPar, gParFractal);
+	if (mainImage->IsUsed() && current.GetHashCode() == autoRefreshLastHash) return;
+
+	cSettings history(cSettings::formatCondensedText);
+	history.CreateText(gPar, gParFractal, gAnimFrames, gKeyframes);
+	history.SaveToFile(systemDirectories.GetHistoryFileName());
+	if (CheckForMissingTextures()) SynchronizeInterface(gPar, gParFractal, qInterface::write);
+	StartRender();
+}
+
+void cInterface::AbsorbAutoRefreshChanges()
+{
+	if (!mainWindow) return;
+	QTimer::singleShot(0, this, [this]() {
+		if (autoRefreshPauseCount > 0) return;
+		CaptureAutoRefreshHash();
+	});
+}
+
+cAutoRefreshPause::cAutoRefreshPause(bool captureHashOnRelease)
+		: captureHashOnRelease(captureHashOnRelease)
+{
+	if (gMainInterface) gMainInterface->DisablePeriodicRefresh();
+}
+
+cAutoRefreshPause::~cAutoRefreshPause()
+{
+	if (gMainInterface) gMainInterface->ReEnablePeriodicRefresh(captureHashOnRelease);
 }
 
 void cInterface::InitPeriodicRefresh()

@@ -45,6 +45,7 @@
 #include "fractparams.hpp"
 #include "global_data.hpp"
 #include "hybrid_fractal_sequences.h"
+#include "initparameters.hpp"
 #include "image_scale.hpp"
 #include "netrender.hpp"
 #include "objects_tree.h"
@@ -59,6 +60,7 @@
 #include "perlin_noise_octaves.h"
 #include "post_effect_hdr_blur.h"
 #include "progress_text.hpp"
+#include "render_checkpoint.hpp"
 #include "render_data.hpp"
 #include "render_image.hpp"
 #include "render_ssao.h"
@@ -111,6 +113,7 @@ cRenderJob::cRenderJob(const std::shared_ptr<cParameterContainer> _params,
 	renderData = nullptr;
 	useSizeFromImage = false;
 	stopRequest = _stopRequest;
+	preserveStopRequest = false;
 
 	id++;
 	// qDebug() << "Id" << id;
@@ -127,6 +130,15 @@ cRenderJob::~cRenderJob()
 	if (canUseNetRender) gNetRender->Release();
 
 	WriteLog("Job finished and closed", 2);
+}
+
+void cRenderJob::ResetStopFlag()
+{
+	if (!renderData || !renderData->stopRequest) return;
+	// PreserveStopRequest is MCP-only. A stop that arrived before Execute
+	// must still stop this job. GUI renders leave the flag false here.
+	if (preserveStopRequest && *renderData->stopRequest) return;
+	*renderData->stopRequest = false;
 }
 
 bool cRenderJob::Init(enumMode _mode, const cRenderingConfiguration &config)
@@ -208,9 +220,14 @@ bool cRenderJob::Init(enumMode _mode, const cRenderingConfiguration &config)
 		}
 	}
 
+	// Preferences and MCP both write these parameters. Read them here so a
+	// change applies to this render, not only after the preferences dialog.
+	if (gPar->IfExists("limit_CPU_cores"))
+		systemData.numberOfThreads = gPar->Get<int>("limit_CPU_cores");
+	if (gPar->IfExists("threads_priority"))
+		systemData.threadsPriority =
+			enumRenderingThreadPriority(gPar->Get<int>("threads_priority"));
 	totalNumberOfCPUs = systemData.numberOfThreads;
-	// totalNumberOfCPUs = 1;
-	// systemData.numberOfThreads = 1;
 
 	// aux renderer data
 	renderData.reset(new sRenderData);
@@ -387,7 +404,7 @@ bool cRenderJob::Execute()
 				// qDebug() << "runningJobs" << runningJobs;
 
 				inProgress = true;
-				*renderData->stopRequest = false;
+				ResetStopFlag();
 
 				WriteLog("cRenderJob::Execute(void): running jobs = " + QString::number(runningJobs), 2);
 
@@ -492,7 +509,13 @@ bool cRenderJob::Execute()
 					ConnectNetRenderSignalsSlots(renderer.get());
 				}
 
+				const bool checkpoint = !checkpointSource.isEmpty() && !twoPassStereo
+																&& !renderData->configuration.UseNetRender();
+				if (checkpoint)
+					renderCheckpoint::Begin(checkpointSource, checkpointOutput, checkpointKind, image,
+						paramsContainer, fractalContainer);
 				result = renderer->RenderImage();
+				if (checkpoint && result) renderCheckpoint::OnImageDone();
 
 				if (twoPassStereo && repeat == 0) renderData->stereo.StoreImageInBuffer(image);
 			}
@@ -507,7 +530,7 @@ bool cRenderJob::Execute()
 			cProgressText progressText;
 			progressText.ResetTimer();
 
-			*renderData->stopRequest = false;
+			ResetStopFlag();
 
 			for (int repeat = 0; repeat < noOfRepeats; repeat++)
 			{
@@ -681,7 +704,7 @@ bool cRenderJob::Execute()
 		fractals->CreateSequences(paramsContainer, fractalContainer, nodes);
 		renderData->hybridFractalSequences = *fractals;
 
-		*renderData->stopRequest = false;
+		ResetStopFlag();
 
 		image->SetImageParameters(params->imageAdjustments);
 		image->SetFastPreview(true);

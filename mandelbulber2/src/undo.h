@@ -66,6 +66,18 @@ public:
 	bool Redo(std::shared_ptr<cParameterContainer> par, std::shared_ptr<cFractalContainer> parFractal,
 		std::shared_ptr<cAnimationFrames> frames, std::shared_ptr<cKeyframes> keyframes,
 		bool *refreshFrames, bool *refreshKeyframes);
+	// Store() waits 500ms before the snapshot becomes an undo step. MCP edits
+	// commit immediately so one call is one undo step.
+	void CommitNow();
+	// MCP undo stops at the scene recorded when this process finished startup.
+	// The window's Undo menu does not use this and can still walk older files.
+	void SetSessionFloor() { sessionFloor = level; }
+	bool CanUndo() const
+	{
+		const int floor = sessionFloor > 1 ? sessionFloor : 1;
+		return level > floor;
+	}
+	bool CanRedo() const { return level < undoBuffer.size(); }
 
 private slots:
 	void slotDelayedStore();
@@ -95,6 +107,7 @@ private:
 	QList<sUndoRecord> undoBuffer;
 	int level;
 	int fileIndex;
+	int sessionFloor;
 };
 
 extern cUndo *gUndo;

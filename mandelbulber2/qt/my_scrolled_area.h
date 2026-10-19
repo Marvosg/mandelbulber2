@@ -43,11 +43,7 @@ class MyScrolledArea : public QScrollArea
 	Q_OBJECT
 
 public:
-	MyScrolledArea(QWidget *parent = nullptr) : QScrollArea(parent)
-	{
-		visibleAreaWidth = width() - verticalScrollBar()->width();
-		visibleAreaHeight = height() - horizontalScrollBar()->height();
-	};
+	MyScrolledArea(QWidget *parent = nullptr) : QScrollArea(parent) { updateVisibleArea(); };
 	int VisibleAreaWidth() { return visibleAreaWidth; }
 	int VisibleAreaHeight() { return visibleAreaHeight; }
 
@@ -55,13 +51,21 @@ private:
 	int visibleAreaWidth;
 	int visibleAreaHeight;
 
+	// Size of the viewport with scroll bars hidden. ScrollBarAlwaysOn used to reserve
+	// that space permanently; AsNeeded should let a fitted image use the whole view.
+	void updateVisibleArea()
+	{
+		const QSize area = maximumViewportSize();
+		visibleAreaWidth = area.width();
+		visibleAreaHeight = area.height();
+	}
+
 protected:
 	void resizeEvent(QResizeEvent *event) override
 	{
 		// qDebug() << "resize event";
 		QScrollArea::resizeEvent(event);
-		visibleAreaWidth = width() - verticalScrollBar()->width();
-		visibleAreaHeight = height() - horizontalScrollBar()->height();
+		updateVisibleArea();
 		emit resized(visibleAreaWidth, visibleAreaHeight);
 	}
 
