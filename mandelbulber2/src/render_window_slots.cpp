@@ -42,6 +42,7 @@
 #include "animation_frames.hpp"
 #include "animation_keyframes.hpp"
 #include "cimage.hpp"
+#include "fractal_container.hpp"
 #include "global_data.hpp"
 #include "image_scale.hpp"
 #include "initparameters.hpp"
@@ -60,17 +61,44 @@
 #include "qt/material_editor.h"
 #include "qt/mesh_export_dialog.h"
 #include "qt/preferences_dialog.h"
+#include "qt/preset_card.h"
 #include "qt/thumbnail_widget.h"
 #include "qt/voxel_export_dialog.h"
 
 #include <algorithm>
 
 #include <QDateTime>
+#include <QDir>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
+#include <QLayout>
 #include <QTimer>
-#include <QWidgetAction>
+
+namespace {
+// A fitted preview is the size of the view with no bars. If bars are already
+// showing, that size is larger than the current viewport and Qt would keep the
+// bars. Hide them before applying a size that fits, then restore AsNeeded.
+void setMainPreviewWidgetSize(MyScrolledArea *area, QWidget *image, int width, int height)
+{
+	static bool busy = false;
+	if (busy) return;
+	busy = true;
+
+	const QSize maxArea = area->maximumViewportSize();
+	const bool fits = width <= maxArea.width() && height <= maxArea.height();
+	if (fits)
+	{
+		area->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+		area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+	}
+	image->setMinimumSize(width, height);
+	area->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+	area->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+	busy = false;
+}
+} // namespace
 
 void RenderWindow::slotResizedScrolledAreaImage(int width, int height) const
 {
@@ -83,8 +111,10 @@ void RenderWindow::slotResizedScrolledAreaImage(int width, int height) const
 			double scale = CalcMainImageScale(0.0, width, height, gMainInterface->mainImage);
 			gMainInterface->mainImage->CreatePreview(scale, width, height, gMainInterface->renderedImage);
 			gMainInterface->mainImage->UpdatePreview();
-			gMainInterface->renderedImage->setMinimumSize(gMainInterface->mainImage->GetPreviewWidth(),
-				gMainInterface->mainImage->GetPreviewHeight());
+			const double dpiScale = devicePixelRatioF();
+			setMainPreviewWidgetSize(ui->scrollAreaForImage, gMainInterface->renderedImage,
+				int(gMainInterface->mainImage->GetPreviewWidth() / dpiScale),
+				int(gMainInterface->mainImage->GetPreviewHeight() / dpiScale));
 		}
 	}
 }
@@ -103,9 +133,9 @@ void RenderWindow::slotChangedComboImageScale(int index) const
 		gMainInterface->mainImage->UpdatePreview();
 
 		double dpiScale = devicePixelRatioF();
-		gMainInterface->renderedImage->setMinimumSize(
-			gMainInterface->mainImage->GetPreviewWidth() / dpiScale,
-			gMainInterface->mainImage->GetPreviewHeight() / dpiScale);
+		setMainPreviewWidgetSize(ui->scrollAreaForImage, gMainInterface->renderedImage,
+			int(gMainInterface->mainImage->GetPreviewWidth() / dpiScale),
+			int(gMainInterface->mainImage->GetPreviewHeight() / dpiScale));
 
 		gPar->Set("image_preview_scale", index);
 	}
@@ -469,17 +499,8 @@ bool RenderWindow::MarkAgentPresetFile(const QString &path)
 
 QString RenderWindow::WaitForPresetThumbnail(const QString &filename, int timeoutMs)
 {
-	slotPopulateToolbar();
-	cThumbnailWidget *thumb = nullptr;
-	const QList<QAction *> actions = ui->toolBar->actions();
-	for (QAction *action : actions)
-	{
-		if (action->objectName() != filename) continue;
-		auto *widgetAction = qobject_cast<QWidgetAction *>(action);
-		if (!widgetAction || !widgetAction->defaultWidget()) continue;
-		thumb = widgetAction->defaultWidget()->findChild<cThumbnailWidget *>();
-		break;
-	}
+	if (!presetStrip) return QString();
+	cThumbnailWidget *thumb = presetStrip->thumbnailFor(filename);
 	if (!thumb) return QString();
 	auto cached = [thumb]() -> QString {
 		if (!thumb->IsRendered()) return QString();
@@ -488,6 +509,7 @@ QString RenderWindow::WaitForPresetThumbnail(const QString &filename, int timeou
 	};
 	const QString ready = cached();
 	if (!ready.isEmpty()) return ready;
+	if (!thumb->CanRenderNow()) return QString();
 	thumb->DisableTimer();
 	QEventLoop loop;
 	QTimer timer;
@@ -503,50 +525,59 @@ QString RenderWindow::WaitForPresetThumbnail(const QString &filename, int timeou
 // adds dynamic actions to the toolbar (example settings)
 void RenderWindow::slotPopulateToolbar(bool completeRefresh)
 {
+	static bool busy = false;
+	if (busy) return;
+	busy = true;
+
 	WriteLog("cInterface::PopulateToolbar(QWidget *window, QToolBar *toolBar) started", 2);
+	if (!presetStrip)
+	{
+		presetStrip = new cPresetStrip(ui->toolBar);
+		ui->toolBar->setContentsMargins(0, 0, 0, 0);
+		if (QLayout *layout = ui->toolBar->layout()) layout->setContentsMargins(0, 0, 0, 0);
+		QWidgetAction *stripAction = new QWidgetAction(this);
+		stripAction->setObjectName("presetStrip");
+		stripAction->setDefaultWidget(presetStrip);
+		ui->toolBar->addAction(stripAction);
+		connect(presetStrip, &cPresetStrip::presetActivated, this, &RenderWindow::slotMenuLoadPreset);
+		connect(
+			presetStrip, &cPresetStrip::removeRequested, this, &RenderWindow::slotMenuRemovePreset);
+		connect(presetStrip, &cPresetStrip::orderChanged, this, &RenderWindow::slotSavePresetOrder);
+
+		QTimer *selectionTimer = new QTimer(this);
+		selectionTimer->setInterval(250);
+		connect(selectionTimer, &QTimer::timeout, this, &RenderWindow::slotUpdatePresetSelection);
+		selectionTimer->start();
+	}
+
 	const QStringList toolbarFiles = OrderedPresetFiles();
-	QSignalMapper *mapPresetsFromExamplesLoad = new QSignalMapper(this);
-	QSignalMapper *mapPresetsFromExamplesRemove = new QSignalMapper(this);
 	ui->toolBar->setIconSize(
 		QSize(gPar->Get<int>("toolbar_icon_size"), gPar->Get<int>("toolbar_icon_size")));
 
 	QList<QAction *> actions = ui->toolBar->actions();
-	QStringList toolbarInActions;
-
-#if QT_VERSION < QT_VERSION_CHECK(5, 15, 0)
-	QApplication::connect(
-		mapPresetsFromExamplesLoad, SIGNAL(mapped(QString)), this, SLOT(slotMenuLoadPreset(QString)));
-#else
-	QApplication::connect(mapPresetsFromExamplesLoad, SIGNAL(mappedString(QString)), this,
-		SLOT(slotMenuLoadPreset(QString)));
-#endif
-
 	for (auto action : actions)
 	{
 		if (action->objectName() == "actionAdd_Settings_to_Toolbar") continue;
-		if (!toolbarFiles.contains(action->objectName()) || completeRefresh)
-		{
-			// preset has been removed
-			ui->toolBar->removeAction(action);
-		}
-		else
-		{
-			toolbarInActions << action->objectName();
-		}
+		if (action->objectName() == "presetStrip") continue;
+		ui->toolBar->removeAction(action);
+		action->deleteLater();
 	}
 
+	const QStringList alreadyShown = completeRefresh ? QStringList() : presetStrip->filenames();
+	QList<cPresetStripItem> items;
 	for (int i = 0; i < toolbarFiles.size(); i++)
 	{
 		if (systemData.globalStopRequest) break;
 
-		if (toolbarInActions.contains(toolbarFiles.at(i)))
+		const QString filename = toolbarFiles.at(i);
+		const bool agent = PresetFileIsAgent(filename);
+		if (alreadyShown.contains(filename))
 		{
-			// already present
+			items.append(cPresetStripItem{filename, nullptr, agent});
 			continue;
 		}
-		const QString filename = toolbarFiles.at(i);
-		cThumbnailWidget *thumbWidget = nullptr;
 
+		cThumbnailWidget *thumbWidget = nullptr;
 		if (QFileInfo(filename).suffix() == QString("fract"))
 		{
 			WriteLogString("Generating thumbnail for preset", filename, 2);
@@ -575,8 +606,10 @@ void RenderWindow::slotPopulateToolbar(bool completeRefresh)
 				{
 					thumbWidget = new cThumbnailWidget(
 						gPar->Get<int>("toolbar_icon_size"), gPar->Get<int>("toolbar_icon_size"), 2, this);
-					par->Set("image_width", gPar->Get<int>("toolbar_icon_size") * 2);
-					par->Set("image_height", gPar->Get<int>("toolbar_icon_size") * 2);
+					// Leave image_width and image_height at the scene size. AssignParameters
+					// scales detail_level by that size, so the small card resolves the same
+					// surface as the viewport. Replacing them with the icon size first makes
+					// the march stop early, and iteration fog then looks under-iterated.
 
 					thumbWidget->UseOneCPUCore(true);
 					par->Set("opencl_mode", gPar->Get<int>("opencl_mode"));
@@ -588,47 +621,81 @@ void RenderWindow::slotPopulateToolbar(bool completeRefresh)
 			}
 		}
 
-		if (thumbWidget)
-		{
-			QWidgetAction *action = new QWidgetAction(this);
-			QToolButton *buttonLoad = new QToolButton;
-			QVBoxLayout *tooltipLayout = new QVBoxLayout;
-			QToolButton *buttonRemove = new QToolButton;
-
-			tooltipLayout->setContentsMargins(3, 3, 3, 3);
-			tooltipLayout->addWidget(thumbWidget);
-			QIcon iconDelete = QIcon::fromTheme("list-remove", QIcon(":system/icons/list-remove.svg"));
-			buttonRemove->setIcon(iconDelete);
-			buttonRemove->setMaximumSize(QSize(15, 15));
-			buttonRemove->setStyleSheet("margin-bottom: -2px; margin-left: -2px;");
-			tooltipLayout->addWidget(buttonRemove);
-			buttonLoad->setToolTip(QObject::tr("Toolbar settings: ") + filename);
-			buttonLoad->setLayout(tooltipLayout);
-			action->setDefaultWidget(buttonLoad);
-			action->setObjectName(toolbarFiles.at(i));
-			ui->toolBar->addAction(action);
-
-			mapPresetsFromExamplesLoad->setMapping(buttonLoad, filename);
-			mapPresetsFromExamplesRemove->setMapping(buttonRemove, filename);
-			QApplication::connect(buttonLoad, SIGNAL(clicked()), mapPresetsFromExamplesLoad, SLOT(map()));
-			QApplication::connect(
-				buttonRemove, SIGNAL(clicked()), mapPresetsFromExamplesRemove, SLOT(map()));
-		}
+		if (thumbWidget) items.append(cPresetStripItem{filename, thumbWidget, agent});
 		QApplication::processEvents();
 	}
 
-#if QT_VERSION < QT_VERSION_CHECK(5, 15, 0)
-	QApplication::connect(mapPresetsFromExamplesRemove, SIGNAL(mapped(QString)), this,
-		SLOT(slotMenuRemovePreset(QString)));
-#else
-	QApplication::connect(mapPresetsFromExamplesRemove, SIGNAL(mappedString(QString)), this,
-		SLOT(slotMenuRemovePreset(QString)));
-#endif
+	presetStrip->sync(items, completeRefresh);
+	slotUpdatePresetSelection();
+	const int barHeight = qMax(presetStrip->height(), ui->toolBar->iconSize().height());
+	ui->toolBar->setMinimumHeight(barHeight);
+	ui->toolBar->updateGeometry();
 
+	busy = false;
 	WriteLog(
 		"cInterface::PopulateToolbar(QWidget *window, QToolBar *toolBar) "
 		"finished",
 		2);
+}
+
+void RenderWindow::slotUpdatePresetSelection()
+{
+	if (!presetStrip || !gPar || !gParFractal || !gInterfaceReadyForSynchronization) return;
+	// Hashing the whole scene here stalls the drag animation, which shares this thread.
+	if (presetStrip->isDragging()) return;
+
+	gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	cSettings current(cSettings::formatCondensedText);
+	current.BeQuiet(true);
+	current.CreateText(gPar, gParFractal);
+	const QString currentHash = current.GetHashCode();
+
+	static QString cachedHash;
+	static QStringList cachedFiles;
+	static QStringList cachedMatches;
+	const QStringList files = presetStrip->filenames();
+	if (currentHash == cachedHash && files == cachedFiles)
+	{
+		presetStrip->setSelectedFiles(cachedMatches);
+		return;
+	}
+
+	QStringList matched;
+	for (const QString &filename : files)
+	{
+		cSettings preset(cSettings::formatFullText);
+		preset.BeQuiet(true);
+		if (!preset.LoadFromFile(filename)) continue;
+
+		// Applying the file on top of the current scene changes nothing only when
+		// every value stored in the preset already matches the scene.
+		auto par = std::make_shared<cParameterContainer>(*gPar);
+		auto fract = std::make_shared<cFractalContainer>(*gParFractal);
+		if (!preset.Decode(par, fract)) continue;
+
+		cSettings applied(cSettings::formatCondensedText);
+		applied.BeQuiet(true);
+		applied.CreateText(par, fract);
+		if (applied.GetHashCode() == currentHash) matched.append(filename);
+	}
+
+	cachedHash = currentHash;
+	cachedFiles = files;
+	cachedMatches = matched;
+	presetStrip->setSelectedFiles(matched);
+}
+
+void RenderWindow::slotSavePresetOrder(const QStringList &filenames)
+{
+	// QDir::Time lists newest first, which is the left-to-right toolbar order.
+	const QDateTime newest = QDateTime::currentDateTime();
+	for (int i = 0; i < filenames.size(); i++)
+	{
+		QFile file(filenames.at(i));
+		if (!file.open(QIODevice::ReadWrite)) continue;
+		file.setFileTime(newest.addSecs(-i), QFileDevice::FileModificationTime);
+		file.close();
+	}
 }
 
 void RenderWindow::slotPresetAddToToolbar()
@@ -644,25 +711,30 @@ void RenderWindow::slotPresetAddToToolbar()
 
 void RenderWindow::slotMenuLoadPreset(QString filename)
 {
-	cSettings parSettings(cSettings::formatFullText);
-	gMainInterface->DisablePeriodicRefresh();
-	parSettings.LoadFromFile(filename);
-	gInterfaceReadyForSynchronization = false;
-	parSettings.Decode(gPar, gParFractal, gAnimFrames, gKeyframes);
-	gMainInterface->materialListModel->Regenerate();
-	ui->widgetEffects->RegenerateLights();
+	{
+		// Leave the previous scene hash in place so the loaded preset counts as a change.
+		cAutoRefreshPause autoRefreshPause(false);
+		cSettings parSettings(cSettings::formatFullText);
+		parSettings.LoadFromFile(filename);
+		gInterfaceReadyForSynchronization = false;
+		parSettings.Decode(gPar, gParFractal, gAnimFrames, gKeyframes);
+		gMainInterface->materialListModel->Regenerate();
+		ui->widgetEffects->RegenerateLights();
 
-	gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::write);
-	gInterfaceReadyForSynchronization = true;
+		gMainInterface->SynchronizeInterface(gPar, gParFractal, qInterface::write);
+		gInterfaceReadyForSynchronization = true;
 
-	gMainInterface->ComboMouseClickUpdate();
-	systemData.lastSettingsFile = gPar->Get<QString>("default_settings_path") + QDir::separator()
-																+ QFileInfo(filename).fileName();
+		gMainInterface->ComboMouseClickUpdate();
+		systemData.lastSettingsFile = gPar->Get<QString>("default_settings_path") + QDir::separator()
+																	+ QFileInfo(filename).fileName();
 
-	gFlightAnimation->RefreshTable();
-	gKeyframeAnimation->RefreshTable();
-	showDescriptionPopup();
-	setWindowTitle(QString("Mandelbulber (") + systemData.lastSettingsFile + ")");
+		gFlightAnimation->RefreshTable();
+		gKeyframeAnimation->RefreshTable();
+		slotUpdatePresetSelection();
+		showDescriptionPopup();
+		setWindowTitle(QString("Mandelbulber (") + systemData.lastSettingsFile + ")");
+	}
+	if (gMainInterface) gMainInterface->RenderViewportIfAutoRefresh();
 }
 
 void RenderWindow::slotMenuRemovePreset(QString filename)

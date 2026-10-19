@@ -51,6 +51,7 @@ RenderWindow::RenderWindow(QWidget *parent) : QMainWindow(parent), ui(new Ui::Re
 	manipulations = new cManipulations(this);
 
 	preferencesDialog = nullptr;
+	presetStrip = nullptr;
 	voxelExportDialog = nullptr;
 	meshExportDialog = nullptr;
 	automatedWidgets = new cAutomatedWidgets(this);

@@ -41,11 +41,13 @@
 
 #include <QImage>
 #include <QPaintEvent>
+#include <QPainter>
 
 #include "src/cimage.hpp"
 #include "src/common_math.h"
 #include "src/files.h"
 #include "src/global_data.hpp"
+#include "src/initparameters.hpp"
 #include "src/interface.hpp"
 #include "src/opencl_engine_render_fractal.h"
 #include "src/render_job.hpp"
@@ -88,6 +90,7 @@ void cThumbnailWidget::Init(QWidget *parent)
 	fractal.reset(new cFractalContainer);
 	useOneCPUCore = false;
 	useForrandomizer = false;
+	cornerRadius = 0;
 
 	timer = new QTimer(this);
 	timer->setSingleShot(true);
@@ -105,6 +108,11 @@ void cThumbnailWidget::SetSize(int _width, int _height, double _oversample)
 	tWidth = _width;
 	tHeight = _height;
 	oversample = _oversample;
+	// The preview buffer stays at device pixels. Doubling the render resolution and
+	// scaling it down is what makes the thumbnail sharper than one sample per pixel.
+	if (gPar && gPar->IfExists("thumbnails_supersampling")
+			&& gPar->Get<bool>("thumbnails_supersampling"))
+		oversample *= 2.0;
 	image.reset(new cImage(tWidth * oversample, tHeight * oversample, true));
 	image->CreatePreview(1.0 / oversample, tWidth, tWidth, this);
 	setFixedWidth(tWidth);
@@ -146,8 +154,59 @@ void cThumbnailWidget::paintEvent(QPaintEvent *event)
 				}
 			}
 		}
-		image->RedrawInWidget(this);
+		const qreal dpr = devicePixelRatioF();
+		if (previewCache.isNull() || previewCacheRadius != cornerRadius || previewCacheDpr != dpr
+				|| previewCacheSize != size())
+		{
+			bool advanced = false;
+			const QImage frame = image->RenderPreviewImage(cornerRadius, dpr, &advanced);
+			previewCache = frame;
+			previewCacheRadius = cornerRadius;
+			previewCacheDpr = dpr;
+			previewCacheSize = size();
+			QPainter painter(this);
+			painter.drawImage(QPointF(0, 0), frame);
+			// The preview swap lands in the buffer after this frame. Drop the cache so the
+			// next paint shows it, then later paints reuse the image while a card is dragged.
+			if (advanced)
+			{
+				previewCache = QImage();
+				update();
+			}
+			return;
+		}
+		QPainter painter(this);
+		painter.drawImage(QPointF(0, 0), previewCache);
 	}
+}
+
+void cThumbnailWidget::slotPreviewChanged()
+{
+	previewCache = QImage();
+	update();
+}
+
+QImage cThumbnailWidget::displayedPreview()
+{
+	if (previewCache.isNull() && image)
+	{
+		previewCache = image->RenderPreviewImage(cornerRadius, devicePixelRatioF());
+		previewCacheRadius = cornerRadius;
+		previewCacheDpr = devicePixelRatioF();
+		previewCacheSize = size();
+	}
+	return previewCache;
+}
+
+void cThumbnailWidget::SetCornerRadius(int radius)
+{
+	cornerRadius = qMax(0, radius);
+	previewCache = QImage();
+	setAutoFillBackground(false);
+	// WA_TranslucentBackground makes this a native macOS window. Native children in
+	// the toolbar hide Qt popups, including combo boxes and Program Preferences.
+	setAttribute(Qt::WA_NoSystemBackground, cornerRadius > 0);
+	update();
 }
 
 void cThumbnailWidget::AssignParameters(std::shared_ptr<const cParameterContainer> _params,
@@ -330,7 +389,7 @@ void cThumbnailWidget::slotRender()
 		renderJob->settingsFile = settingsFile;
 		connect(renderJob, SIGNAL(updateProgressAndStatus(const QString &, const QString &, double)),
 			this, SIGNAL(updateProgressAndStatus(const QString &, const QString &, double)));
-		connect(renderJob, SIGNAL(updateImage()), this, SLOT(update()));
+		connect(renderJob, SIGNAL(updateImage()), this, SLOT(slotPreviewChanged()));
 		connect(renderJob, &cRenderJob::signalTotalRenderTime, this,
 			&cThumbnailWidget::signalTotalRenderTime);
 

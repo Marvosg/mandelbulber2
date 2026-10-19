@@ -252,7 +252,7 @@ bool cFlightAnimation::slotRenderFlight()
 
 void cFlightAnimation::RecordFlight(bool continueRecording)
 {
-	mainInterface->DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	// get latest values of all parameters
 	mainInterface->SynchronizeInterface(params, fractalParams, qInterface::read);
@@ -995,7 +995,7 @@ void cFlightAnimation::ConfirmAndSendRenderedFrames(
 
 bool cFlightAnimation::RenderFlight(bool *stopRequest)
 {
-	mainInterface->DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	if (image->IsUsed())
 	{

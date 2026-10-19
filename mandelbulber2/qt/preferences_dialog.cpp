@@ -124,6 +124,9 @@ cPreferencesDialog::~cPreferencesDialog()
 
 void cPreferencesDialog::on_buttonBox_accepted()
 {
+#ifndef USE_OPENCL
+	const bool supersamplingWas = gPar->Get<bool>("thumbnails_supersampling");
+#endif
 	SynchronizeInterfaceWindow(this, gPar, qInterface::read);
 
 	QFont font = gMainInterface->mainWindow->font();
@@ -179,6 +182,9 @@ void cPreferencesDialog::on_buttonBox_accepted()
 
 	gPar->Set<int>("toolbar_icon_size", gPar->Get<int>("toolbar_icon_size"));
 	gMainInterface->mainWindow->slotPopulateToolbar(true);
+#else
+	if (gPar->Get<bool>("thumbnails_supersampling") != supersamplingWas)
+		gMainInterface->mainWindow->slotPopulateToolbar(true);
 #endif
 }
 

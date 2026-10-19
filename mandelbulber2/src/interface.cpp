@@ -34,6 +34,9 @@
 
 #include "interface.hpp"
 
+#include <QMessageBox>
+#include <QTimer>
+
 #include "ui_render_window.h"
 
 #include "animation_flight.hpp"
@@ -93,6 +96,9 @@
 #include "qt/settings_cleaner.h"
 #include "qt/system_tray.hpp"
 
+#include <QGuiApplication>
+#include <QScreen>
+
 // custom includes
 #ifdef USE_GAMEPAD
 #include <QtGamepad/qgamepadmanager.h>
@@ -122,7 +128,7 @@ cInterface::cInterface(QObject *parent) : QObject(parent)
 	systemTray = nullptr;
 	stopRequest = false;
 	repeatRequest = false;
-	autoRefreshLastState = false;
+	autoRefreshPauseCount = 0;
 	lockedDetailLevel = 1.0;
 	lastSelectedMaterial = 1;
 }
@@ -241,8 +247,12 @@ void cInterface::ShowUi()
 	mainImage->ConvertTo8bitChar();
 	mainImage->UpdatePreview();
 	mainImage->SetAsMainImage();
-	renderedImage->setMinimumSize(
-		int(mainImage->GetPreviewWidth()), int(mainImage->GetPreviewHeight()));
+	// Preview storage is in device pixels. The widget size is in logical points;
+	// using the device size here makes the view claim the screen and pushes the
+	// right-hand dock past the edge.
+	const double previewDpi = renderedImage->devicePixelRatioF();
+	renderedImage->setMinimumSize(int(mainImage->GetPreviewWidth() / previewDpi),
+		int(mainImage->GetPreviewHeight() / previewDpi));
 	renderedImage->AssignImage(mainImage);
 	renderedImage->AssignParameters(gPar, gParFractal);
 
@@ -362,13 +372,24 @@ void cInterface::ShowUi()
 	mainWindow->slotPopulateCustomWindowStates();
 	systemTray = new cSystemTray(mainImage, mainWindow);
 
+	// installing event filter for disabling tooltips
+	gApplication->installEventFilter(mainWindow);
+
+	WriteLog("cInterface::ConnectSignals(void)", 2);
+	ConnectSignals();
+	WriteLog("cInterface::ConnectSignals(void) finished", 2);
+
 	WriteLog("Restoring window geometry", 2);
 
-	mainWindow->restoreGeometry(settings.value("mainWindowGeometry").toByteArray());
+	const QByteArray savedGeometry = settings.value("mainWindowGeometry").toByteArray();
+	if (!savedGeometry.isEmpty())
+		renderedImage->setMinimumSize(0, 0);
+	mainWindow->restoreGeometry(savedGeometry);
 
 	WriteLog("Restoring window state", 2);
 
-	if (!mainWindow->restoreState(settings.value("mainWindowState").toByteArray()))
+	const QByteArray savedState = settings.value("mainWindowState").toByteArray();
+	if (!mainWindow->restoreState(savedState))
 	{
 		mainWindow->tabifyDockWidget(
 			mainWindow->ui->dockWidget_materialEditor, mainWindow->ui->dockWidget_effects);
@@ -385,15 +406,27 @@ void cInterface::ShowUi()
 		mainWindow->ui->dockWidget_histogram->hide();
 		mainWindow->ui->dockWidget_queue_dock->hide();
 	}
-	if (!settings.value("mainWindowState").toByteArray().contains("dockWidget_background_renders"))
+	if (!savedState.contains("dockWidget_background_renders"))
 		mainWindow->PlaceBackgroundRendersDock();
 
-	// installing event filter for disabling tooltips
-	gApplication->installEventFilter(mainWindow);
-
-	WriteLog("cInterface::ConnectSignals(void)", 2);
-	ConnectSignals();
-	WriteLog("cInterface::ConnectSignals(void) finished", 2);
+	// Docks are in their final places now. Keep the whole frame, including the
+	// navigation dock to the right of the view, inside the visible screen.
+	QScreen *screen = mainWindow->screen();
+	if (!screen) screen = QGuiApplication::primaryScreen();
+	if (screen)
+	{
+		const QRect available = screen->availableGeometry();
+		const QRect frame = mainWindow->frameGeometry();
+		const int maxWidth = available.width() - (frame.width() - mainWindow->width());
+		const int maxHeight = available.height() - (frame.height() - mainWindow->height());
+		if (mainWindow->width() > maxWidth || mainWindow->height() > maxHeight)
+		{
+			renderedImage->setMinimumSize(0, 0);
+			mainWindow->setMinimumSize(0, 0);
+			mainWindow->resize(
+				qMin(mainWindow->width(), maxWidth), qMin(mainWindow->height(), maxHeight));
+		}
+	}
 }
 
 void cInterface::ConnectSignals() const
@@ -700,13 +733,11 @@ void cInterface::StartRender(bool noUndo)
 	progressBarAnimation->hide();
 	SynchronizeInterface(gPar, gParFractal, qInterface::read);
 
-	if (mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked())
-	{
-		// check if something was changed in settings
-		cSettings tempSettings(cSettings::formatCondensedText);
-		tempSettings.CreateText(gPar, gParFractal);
-		autoRefreshLastHash = tempSettings.GetHashCode();
-	}
+	// Scene this viewport render was started from. Turning auto-refresh on compares
+	// against it and leaves an in-progress render of the same scene running.
+	cSettings tempSettings(cSettings::formatCondensedText);
+	tempSettings.CreateText(gPar, gParFractal);
+	autoRefreshLastHash = tempSettings.GetHashCode();
 
 	cScripts::EvaluateAll(gPar, gParFractal);
 
@@ -1490,10 +1521,11 @@ bool cInterface::QuitApplicationDialog()
 
 			QFile::remove(systemDirectories.GetAutosaveFile());
 
+			if (mainWindow)
+				settings.setValue("mainWindowGeometry", mainWindow->saveGeometry());
 			if (detachedWindow)
-			{
 				settings.setValue("detachedWindowGeometry", detachedWindow->saveGeometry());
-			}
+			settings.sync();
 
 			ClearNetRenderCache();
 
@@ -1802,7 +1834,7 @@ void cInterface::SetQuickRenderParameters(const std::shared_ptr<cParameterContai
 
 void cInterface::OptimizeStepFactor(double qualityTarget)
 {
-	DisablePeriodicRefresh();
+	cAutoRefreshPause autoRefreshPause;
 
 	// check if main image is not used by other rendering process
 	if (mainImage->IsUsed())
@@ -1904,8 +1936,6 @@ void cInterface::OptimizeStepFactor(double qualityTarget)
 			.arg(DEFactor)
 			.arg(missedDE),
 		1.0, cProgressText::progress_IMAGE);
-
-	ReEnablePeriodicRefresh();
 }
 
 void cInterface::ResetFormula(int fractalNumber) const
@@ -1935,7 +1965,7 @@ void cInterface::ResetFormula(int fractalNumber) const
 
 void cInterface::PeriodicRefresh()
 {
-	if (!mainWindow->manipulations->isDraggingStarted())
+	if (autoRefreshPauseCount == 0 && !mainWindow->manipulations->isDraggingStarted())
 	{
 		if (mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked())
 		{
@@ -1958,25 +1988,74 @@ void cInterface::PeriodicRefresh()
 
 void cInterface::DisablePeriodicRefresh()
 {
-	if (mainWindow)
-	{
-		autoRefreshLastState = mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked();
-		mainWindow->ui->widgetDockNavigation->AutoRefreshSetChecked(false);
-		gPar->Set("auto_refresh", false);
-	}
+	autoRefreshPauseCount++;
 }
 
-void cInterface::ReEnablePeriodicRefresh()
+void cInterface::ReEnablePeriodicRefresh(bool captureHash)
 {
+	if (autoRefreshPauseCount > 0) autoRefreshPauseCount--;
+	if (autoRefreshPauseCount > 0) return;
+	if (captureHash) CaptureAutoRefreshHash();
+}
+
+void cInterface::CaptureAutoRefreshHash()
+{
+	if (!mainWindow || !gPar || !gParFractal) return;
 	SynchronizeInterface(gPar, gParFractal, qInterface::read);
 	cSettings tempSettings(cSettings::formatCondensedText);
 	tempSettings.CreateText(gPar, gParFractal);
 	autoRefreshLastHash = tempSettings.GetHashCode();
-	if (autoRefreshLastState)
-	{
-		mainWindow->ui->widgetDockNavigation->AutoRefreshSetChecked(true);
-		gPar->Set("auto_refresh", true);
-	}
+}
+
+void cInterface::SetAutoRefreshEnabled(bool enabled)
+{
+	if (!gPar) return;
+	gPar->Set("auto_refresh", enabled);
+	if (!mainWindow || !gInterfaceReadyForSynchronization) return;
+
+	SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	gPar->Set("auto_refresh", enabled);
+	cSettings parSettings(cSettings::formatAppSettings);
+	parSettings.CreateText(gPar, gParFractal, gAnimFrames, gKeyframes);
+	parSettings.SaveToFile(systemData.GetIniFile());
+}
+
+void cInterface::RenderViewportIfAutoRefresh()
+{
+	if (!mainWindow || !mainImage || !gPar || !gParFractal) return;
+	if (autoRefreshPauseCount > 0) return;
+	if (!mainWindow->ui->widgetDockNavigation->AutoRefreshIsChecked()) return;
+
+	SynchronizeInterface(gPar, gParFractal, qInterface::read);
+	cSettings current(cSettings::formatCondensedText);
+	current.CreateText(gPar, gParFractal);
+	if (mainImage->IsUsed() && current.GetHashCode() == autoRefreshLastHash) return;
+
+	cSettings history(cSettings::formatCondensedText);
+	history.CreateText(gPar, gParFractal, gAnimFrames, gKeyframes);
+	history.SaveToFile(systemDirectories.GetHistoryFileName());
+	if (CheckForMissingTextures()) SynchronizeInterface(gPar, gParFractal, qInterface::write);
+	StartRender();
+}
+
+void cInterface::AbsorbAutoRefreshChanges()
+{
+	if (!mainWindow) return;
+	QTimer::singleShot(0, this, [this]() {
+		if (autoRefreshPauseCount > 0) return;
+		CaptureAutoRefreshHash();
+	});
+}
+
+cAutoRefreshPause::cAutoRefreshPause(bool captureHashOnRelease)
+		: captureHashOnRelease(captureHashOnRelease)
+{
+	if (gMainInterface) gMainInterface->DisablePeriodicRefresh();
+}
+
+cAutoRefreshPause::~cAutoRefreshPause()
+{
+	if (gMainInterface) gMainInterface->ReEnablePeriodicRefresh(captureHashOnRelease);
 }
 
 void cInterface::InitPeriodicRefresh()

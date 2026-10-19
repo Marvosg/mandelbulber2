@@ -169,7 +169,9 @@ bool cUndo::Undo(std::shared_ptr<cParameterContainer> par,
 
 			if (record.isLoaded)
 			{
+				const bool keepAutoRefresh = par->Get<bool>("auto_refresh");
 				*par = *record.mainParams;
+				par->Set("auto_refresh", keepAutoRefresh);
 				parFractal->ResetDataFrom(*record.fractParams);
 				if (frames && record.hasFrames)
 				{
@@ -205,7 +207,9 @@ bool cUndo::Redo(std::shared_ptr<cParameterContainer> par,
 		fileIndex = (fileIndex + 1 + 100) % 100;
 		if (record.isLoaded)
 		{
+			const bool keepAutoRefresh = par->Get<bool>("auto_refresh");
 			*par = *record.mainParams;
+			par->Set("auto_refresh", keepAutoRefresh);
 			parFractal->ResetDataFrom(*record.fractParams);
 			if (frames && record.hasFrames)
 			{

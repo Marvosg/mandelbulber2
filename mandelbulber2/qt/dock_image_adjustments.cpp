@@ -74,7 +74,9 @@ cDockImageAdjustments::~cDockImageAdjustments()
 
 void cDockImageAdjustments::slotDisableAutoRefresh()
 {
-	gMainInterface->DisablePeriodicRefresh();
+	// Brightness, contrast, gamma and HDR are applied after the fractal render.
+	// Keep auto-refresh on; just don't start a new fractal render for this edit.
+	if (gMainInterface) gMainInterface->AbsorbAutoRefreshChanges();
 }
 
 void cDockImageAdjustments::ConnectSignals() const

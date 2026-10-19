@@ -248,7 +248,8 @@ int main(int argc, char *argv[])
 		if (!recovered) gMainInterface->LoadDefaultSettings();
 		gMainInterface->InitPeriodicRefresh();
 		gMainInterface->mainWindow->slotPopulateToolbar();
-		gMainInterface->OfferRenderResume();
+		const bool resumingWindow = gMainInterface->OfferRenderResume();
+		if (!resumingWindow) gMainInterface->RenderViewportIfAutoRefresh();
 	}
 
 	if (gMcpServer) gMcpServer->NoteBaseline();

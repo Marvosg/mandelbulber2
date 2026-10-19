@@ -59,6 +59,7 @@ class cDockRenderingEngine;
 class cDockFractal;
 class cDockEffects;
 class cManipulations;
+class cPresetStrip;
 
 namespace Ui
 {
@@ -101,7 +102,7 @@ public slots:
 		double progress,
 		cProgressText::enumProgressType progressType = cProgressText::progress_IMAGE) const;
 	void slotPopulateToolbar(bool completeRefresh = false);
-	// Toolbar folder the preset list reads, and the agent subfolder beside the user's picks.
+	// Toolbar folder the preset strip reads, and the agent subfolder beside the user's picks.
 	static QString ToolbarPresetDirectory();
 	static QString AgentPresetDirectory();
 	// True for a file in the agent folder or one whose header was marked when the agent saved it.
@@ -109,7 +110,7 @@ public slots:
 	// User presets, then agent presets. Each group is newest first.
 	static QStringList OrderedPresetFiles();
 	static bool MarkAgentPresetFile(const QString &path);
-	// Empty until that preset's toolbar thumbnail has finished.
+	// Empty until the strip has finished that preset's thumbnail.
 	QString WaitForPresetThumbnail(const QString &filename, int timeoutMs);
 	void slotPopulateCustomWindowStates(bool completeRefresh = false);
 	void slotQuestionMessage(const QString &questionTitle, const QString &questionText,
@@ -200,6 +201,8 @@ private slots:
 
 	// toolbar and custom window settings
 	void slotPresetAddToToolbar();
+	void slotSavePresetOrder(const QStringList &filenames);
+	void slotUpdatePresetSelection();
 	void slotCustomWindowStateAddToMenu();
 	void slotCustomWindowRemovePopup();
 
@@ -229,6 +232,7 @@ private:
 	QList<int> currentKeyEvents;
 	Qt::KeyboardModifiers lastKeyEventModifiers;
 	cManipulations *manipulations;
+	cPresetStrip *presetStrip;
 
 signals:
 	void updateProgressAndStatus(const QString &text, const QString &progressText, double progress);
